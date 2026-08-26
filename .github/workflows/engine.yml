@@ -1,14 +1,20 @@
 # Install Unreal Engine on a PUBLIC repository's runner, and time it.
 #
-# WHAT RUN 33016837041 MEASURED, and why the defaults below changed:
-#   clone --depth 1 --branch 5.8   51 s,  ~4 GB
-#   Setup.sh, no arguments         637 s, tree reached 116163 MB and was
-#                                  KILLED at the 6 GB disk floor, rc 137.
-# 113 GB, and not finished. Setup.sh's own "31113.5 MiB" is the DOWNLOAD
-# size; by default GitDependencies also keeps every downloaded pack in
-# .git/ue-gitdeps and then extracts it, so the tree carries the archive and
-# its contents at once. --no-cache is therefore the default here now. A
-# number off a tool's banner is not the number on the disk.
+# WHAT HAS BEEN MEASURED SO FAR, both on this workflow:
+#   run 33016837041, no arguments   Setup.sh KILLED at the 6 GB disk floor
+#                                   after 637 s, tree 116163 MB (113 GB)
+#   run 33018377868, --no-cache     Setup.sh rc=0 in 295 s, tree 96502 MB
+#                                   (94 GB), clone 49 s, whole job 445 s
+# So --no-cache is the difference between finishing and not, and it is the
+# default here. Setup.sh's own "31113.5 MiB" is the DOWNLOAD size; the tree on
+# disk is three times that. A number off a tool's banner is not the number on
+# the disk.
+#
+# THIS REPO IS NEVER CHECKED OUT. Only the private one is, into `work/`. Any
+# helper a step calls must live in the PRIVATE repo: run 33018377868 measured
+# everything correctly and then lost its report to
+# `bash: /home/runner/work/Runner/Runner/push-with-merge.sh: No such file or
+# directory`, rc 127 -- and reported the step, and the whole job, as SUCCESS.
 #
 # NOTHING IS BUILT HERE. Clone, Setup.sh, report. Compiling on 4 cores inside
 # a 6-hour job is a separate question.
@@ -28,11 +34,11 @@ on:
         default: '5.8'
       setup_args:
         description: 'Setup.sh args. --no-cache stops GitDependencies keeping
-          every downloaded pack alongside the files it extracted from it;
-          without it the tree passed 113 GB and was killed. Add
-          --exclude=Android --exclude=IOS --exclude=VisionOS to drop platforms
-          this project never targets (those folder names are measured, not
-          guessed -- see Reports/cloud_host/engine_deps_help.txt).'
+          every downloaded pack alongside what it extracted; without it the
+          tree passed 113 GB and was killed. Add --exclude=Android
+          --exclude=IOS --exclude=VisionOS to drop platforms this project
+          never targets (folder names measured, not guessed -- see
+          Reports/cloud_host/engine_deps_help.txt).'
         default: '--no-cache'
       commit:
         description: 'push the report to the private repo'
@@ -120,10 +126,9 @@ jobs:
           ( cd /mnt/ue && ./Setup.sh $ARGS ) > /tmp/setup.log 2>&1 &
           PID=$!
 
-          # A progress trail, so a job that dies still leaves a curve rather
-          # than a single "it failed". Run 33016837041 is why: its curve is
-          # the only reason we know the tree reached 113 GB rather than
-          # simply that Setup.sh stopped.
+          # The trail is echoed to the LOG as well as the report, because two
+          # runs in a row lost their report to a broken push and the log was
+          # the only place the numbers survived.
           KILLED=no
           while kill -0 "$PID" 2>/dev/null; do
             FREE=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
@@ -151,6 +156,7 @@ jobs:
           cat "$PROG"
 
       - name: Write the report and push it to the PRIVATE repo
+        id: deliver
         if: ${{ always() && steps.secret.outputs.ok == 'yes' }}
         working-directory: work
         env:
@@ -168,7 +174,7 @@ jobs:
           BRANCH: ${{ vars.TBS_BRANCH || 'claude/gateway-auth-fix-nr7k0b' }}
         run: |
           set +e
-          OUT="Reports/cloud_host/engine_public_runner.txt"
+          OUT="Reports/cloud_host/engine_public_runner_${RUN_ID}.txt"
           mkdir -p Reports/cloud_host
           {
             echo "Installing Unreal Engine on a PUBLIC repository's hosted runner."
@@ -196,12 +202,10 @@ jobs:
             echo "== VERDICT =="
             if [ "${S_KILL}" = "yes" ]; then
               echo "DOES NOT FIT at these arguments. Setup.sh was still running"
-              echo "when free space reached the floor. Compare the tree size"
-              echo "against Setup.sh's stated download size before concluding"
-              echo "anything about the engine: the difference is the cache."
+              echo "when free space reached the floor."
             elif [ "${C_RC}" != "0" ]; then
               echo "NOT MEASURED past the clone. The clone itself failed, so"
-              echo "nothing here says anything about whether the engine fits."
+              echo "nothing here says whether the engine fits."
             elif [ "${S_RC}" = "0" ]; then
               echo "INSTALLED. This is the real installed size and the real"
               echo "wall-clock cost. It says NOTHING about compiling it, and"
@@ -221,7 +225,15 @@ jobs:
 
           if [ "$DO_COMMIT" != "true" ]; then
             echo "commit not requested -- stopping."
+            echo "delivered=skipped" >> "$GITHUB_OUTPUT"
             exit 0
+          fi
+          if [ ! -f Tools/push_with_merge.sh ]; then
+            echo "Tools/push_with_merge.sh is missing from the checkout."
+            echo "The helper is ABSENT -- that is not the same answer as a"
+            echo "push that was refused."
+            echo "delivered=no" >> "$GITHUB_OUTPUT"
+            exit 1
           fi
           git config user.name  "tbs-runner"
           git config user.email "noreply@github.com"
@@ -229,23 +241,27 @@ jobs:
           git commit -m "engine: install measured on the public runner, run ${RUN_ID}"
           if [ $? -ne 0 ]; then
             echo "nothing to commit."
-            exit 0
+            echo "delivered=no" >> "$GITHUB_OUTPUT"
+            exit 1
           fi
           H=$(git rev-parse --short HEAD)
           python3 Tools/record_commit.py "$H" \
-            "Unreal Engine install measured on the public runner (\`${OUT}\`), run ${RUN_ID}: clone rc=${C_RC} in ${C_SECS}s, Setup.sh rc=${S_RC} in ${S_SECS}s, tree ${S_SIZE}MB, killed=${S_KILL}. Written by \`Runner\` \`engine.yml\`, not by a person."
+            "Unreal Engine install measured on the public runner (\`${OUT}\`), run ${RUN_ID}: clone rc=${C_RC} in ${C_SECS}s, Setup.sh rc=${S_RC} in ${S_SECS}s with \`${ARGS}\`, tree ${S_SIZE}MB, killed=${S_KILL}. Written by \`Runner\` \`engine.yml\`, not by a person."
           if [ $? -ne 0 ]; then
             echo "record_commit failed -- not pushing an unrecorded commit."
+            echo "delivered=no" >> "$GITHUB_OUTPUT"
             exit 1
           fi
           git add Team/CHANGELOG.md
           git commit -m "changelog: record ${H}"
 
-          # Run 33016837041 measured everything, committed it, and then lost
-          # the lot to a rejected push because a session pushed to the same
-          # branch during the job. A push is the delivery.
-          bash "${GITHUB_WORKSPACE}/push-with-merge.sh" "${BRANCH}"
-          echo "push script rc=$?"
+          bash Tools/push_with_merge.sh "${BRANCH}"
+          if [ $? -ne 0 ]; then
+            echo "delivered=no" >> "$GITHUB_OUTPUT"
+            echo "THE REPORT DID NOT REACH THE REPOSITORY."
+            exit 1
+          fi
+          echo "delivered=yes" >> "$GITHUB_OUTPUT"
 
       - name: Verdict
         if: ${{ always() }}
@@ -263,4 +279,13 @@ jobs:
             echo "Setup.sh rc=${{ steps.setup.outputs.rc }}, killed=${{ steps.setup.outputs.killed }}, tree ${{ steps.setup.outputs.size }} MB -- see the report."
             exit 1
           fi
-          echo "engine installed: ${{ steps.setup.outputs.size }} MB in ${{ steps.setup.outputs.secs }}s"
+          # A measurement that never reached the repository is a measurement
+          # nobody can cite. Two runs were lost this way before this check
+          # existed, and both jobs reported success.
+          if [ "${{ steps.deliver.outputs.delivered }}" = "no" ]; then
+            echo "engine installed: ${{ steps.setup.outputs.size }} MB in ${{ steps.setup.outputs.secs }}s"
+            echo "BUT THE REPORT DID NOT REACH THE REPOSITORY, so it does not"
+            echo "count. The numbers are in this job's log only."
+            exit 1
+          fi
+          echo "engine installed: ${{ steps.setup.outputs.size }} MB in ${{ steps.setup.outputs.secs }}s, report delivered"
