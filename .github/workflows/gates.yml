@@ -1,0 +1,98 @@
+# The private project's 25 gates, run on a public repository's runner.
+#
+# WHY IT IS SAFE TO RUN PRIVATE CODE HERE, and where the edge is:
+#   * the private repo is checked out into the job workspace, which is
+#     destroyed with the job. Nothing from it is ever committed to THIS repo.
+#   * a public repository's job log is world-readable, so the gate output is
+#     NOT printed. Tools/run_gates.py writes every gate's full output to a
+#     transcript file and prints only "which command, pass or fail". The
+#     transcript is pushed to the PRIVATE repo.
+#   * secrets are not given to forks, and workflow_dispatch here requires
+#     write access, so TBS_PRIVATE_TOKEN is not reachable from this page.
+#
+# Every `run:` block is `bash -e`. A failing command kills the step before a
+# later line can record its exit code, which is exactly what a gate run must
+# not do -- a red gate suite MUST still get its transcript committed. Hence
+# `set +e` and an explicit rc, not `set -e` with hope.
+name: gates
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: 'push the transcript back to the private repo'
+        type: boolean
+        default: true
+
+permissions: {}
+
+jobs:
+  gates:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Refuse clearly if the secret is missing
+        env:
+          TOK: ${{ secrets.TBS_PRIVATE_TOKEN }}
+        run: |
+          set +e
+          if [ -z "$TOK" ]; then
+            echo "TBS_PRIVATE_TOKEN is not set on this repository."
+            echo "Create a fine-grained PAT scoped to Claud-Cloud-Project only,"
+            echo "Contents: read and write, and add it as a repository secret."
+            echo "Stopping here rather than failing later in a confusing way."
+            exit 1
+          fi
+          echo "secret present"
+
+      - uses: actions/checkout@v4
+        with:
+          repository: Mohammadlali/Claud-Cloud-Project
+          ref: ${{ vars.TBS_BRANCH || 'claude/gateway-auth-fix-nr7k0b' }}
+          token: ${{ secrets.TBS_PRIVATE_TOKEN }}
+          fetch-depth: 0          # check_changelog walks the whole history
+          path: work
+
+      - name: Run the 25 gates
+        id: run
+        working-directory: work
+        run: |
+          set +e
+          echo "machine : $(nproc) cores, $(free -g | awk '/^Mem:/{print $2}') GB ram"
+          echo "head    : $(git rev-parse --short HEAD)"
+          TS=$(date -u +%Y%m%dT%H%M%SZ)
+          OUT="Reports/gates/gates-${TS}.txt"
+          mkdir -p Reports/gates
+          python3 Tools/run_gates.py --out "$OUT"
+          RC=$?
+          echo "rc=$RC"          >> "$GITHUB_OUTPUT"
+          echo "out=$OUT"        >> "$GITHUB_OUTPUT"
+          echo "gates exit code : $RC"
+
+      - name: Push the transcript to the PRIVATE repo
+        if: ${{ always() && inputs.commit }}
+        working-directory: work
+        run: |
+          set +e
+          OUT="${{ steps.run.outputs.out }}"
+          if [ ! -f "$OUT" ]; then
+            echo "no transcript at '$OUT' -- the run died before writing one."
+            echo "That is a real answer and it is not 'the gates passed'."
+            exit 0
+          fi
+          git config user.name  "tbs-runner"
+          git config user.email "noreply@github.com"
+          git add "$OUT"
+          git commit -m "gates: transcript from the public runner, rc=${{ steps.run.outputs.rc }}"
+          git push origin HEAD:"${{ vars.TBS_BRANCH || 'claude/gateway-auth-fix-nr7k0b' }}"
+          echo "push rc=$?"
+
+      - name: Fail the job if any gate did not pass
+        if: ${{ always() }}
+        run: |
+          set +e
+          RC="${{ steps.run.outputs.rc }}"
+          if [ "$RC" != "0" ]; then
+            echo "gate suite exit code $RC -- not green."
+            exit 1
+          fi
+          echo "25 gates green"
