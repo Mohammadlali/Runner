@@ -14,6 +14,12 @@
 # later line can record its exit code, which is exactly what a gate run must
 # not do -- a red gate suite MUST still get its transcript committed. Hence
 # `set +e` and an explicit rc, not `set -e` with hope.
+#
+# Run 1 of this workflow failed three times over for ONE cause: the secret
+# guard exited 1, so checkout never ran, and two later `always()` steps then
+# reported a missing directory and an empty exit code. Three error lines, one
+# fact. The guard now sets an OUTPUT and every later step is conditioned on
+# it, so a missing secret produces exactly one message that names itself.
 name: gates
 
 on:
@@ -30,21 +36,22 @@ jobs:
   gates:
     runs-on: ubuntu-latest
     steps:
-      - name: Refuse clearly if the secret is missing
+      - name: Is the secret present at all
+        id: secret
         env:
           TOK: ${{ secrets.TBS_PRIVATE_TOKEN }}
         run: |
           set +e
           if [ -z "$TOK" ]; then
-            echo "TBS_PRIVATE_TOKEN is not set on this repository."
-            echo "Create a fine-grained PAT scoped to Claud-Cloud-Project only,"
-            echo "Contents: read and write, and add it as a repository secret."
-            echo "Stopping here rather than failing later in a confusing way."
-            exit 1
+            echo "ok=no" >> "$GITHUB_OUTPUT"
+            echo "TBS_PRIVATE_TOKEN is NOT set on this repository."
+          else
+            echo "ok=yes" >> "$GITHUB_OUTPUT"
+            echo "secret present"
           fi
-          echo "secret present"
 
       - uses: actions/checkout@v4
+        if: steps.secret.outputs.ok == 'yes'
         with:
           repository: Mohammadlali/Claud-Cloud-Project
           ref: ${{ vars.TBS_BRANCH || 'claude/gateway-auth-fix-nr7k0b' }}
@@ -54,6 +61,7 @@ jobs:
 
       - name: Run the 25 gates
         id: run
+        if: steps.secret.outputs.ok == 'yes'
         working-directory: work
         run: |
           set +e
@@ -64,19 +72,19 @@ jobs:
           mkdir -p Reports/gates
           python3 Tools/run_gates.py --out "$OUT"
           RC=$?
-          echo "rc=$RC"          >> "$GITHUB_OUTPUT"
-          echo "out=$OUT"        >> "$GITHUB_OUTPUT"
+          echo "rc=$RC"   >> "$GITHUB_OUTPUT"
+          echo "out=$OUT" >> "$GITHUB_OUTPUT"
           echo "gates exit code : $RC"
 
       - name: Push the transcript to the PRIVATE repo
-        if: ${{ always() && inputs.commit }}
+        if: ${{ always() && steps.secret.outputs.ok == 'yes' && inputs.commit }}
         working-directory: work
         run: |
           set +e
           OUT="${{ steps.run.outputs.out }}"
           if [ ! -f "$OUT" ]; then
-            echo "no transcript at '$OUT' -- the run died before writing one."
-            echo "That is a real answer and it is not 'the gates passed'."
+            echo "no transcript at '${OUT}' -- the run died before writing one."
+            echo "That is a real answer and it is NOT 'the gates passed'."
             exit 0
           fi
           git config user.name  "tbs-runner"
@@ -86,11 +94,23 @@ jobs:
           git push origin HEAD:"${{ vars.TBS_BRANCH || 'claude/gateway-auth-fix-nr7k0b' }}"
           echo "push rc=$?"
 
-      - name: Fail the job if any gate did not pass
+      - name: Verdict
         if: ${{ always() }}
         run: |
           set +e
+          if [ "${{ steps.secret.outputs.ok }}" != "yes" ]; then
+            echo "NOT MEASURED. The gates did not run, and that is not a pass."
+            echo ""
+            echo "Add a repository secret named TBS_PRIVATE_TOKEN: a"
+            echo "fine-grained personal access token scoped to"
+            echo "Mohammadlali/Claud-Cloud-Project ONLY, Contents: read+write."
+            exit 1
+          fi
           RC="${{ steps.run.outputs.rc }}"
+          if [ -z "$RC" ]; then
+            echo "NOT MEASURED. The gate step produced no exit code."
+            exit 1
+          fi
           if [ "$RC" != "0" ]; then
             echo "gate suite exit code $RC -- not green."
             exit 1
