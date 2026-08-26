@@ -1,19 +1,20 @@
 # Install Unreal Engine on a PUBLIC repository's runner, and time it.
 #
-# The question is only "how long, and does it fit". It was already settled
-# that it does NOT fit a private runner: Setup.sh wants 31113.5 MiB across
-# 134334 files, and the tree hit 40 GB with 3 GB free in 196 s against 43 GB
-# total (Claud-Cloud-Project, run 33000932367). This machine has 116 GB free
-# and 15 GB of RAM, measured, so disk is no longer the constraint and the
-# honest measurement is the FULL install with no --exclude at all.
+# WHAT RUN 33016837041 MEASURED, and why the defaults below changed:
+#   clone --depth 1 --branch 5.8   51 s,  ~4 GB
+#   Setup.sh, no arguments         637 s, tree reached 116163 MB and was
+#                                  KILLED at the 6 GB disk floor, rc 137.
+# 113 GB, and not finished. Setup.sh's own "31113.5 MiB" is the DOWNLOAD
+# size; by default GitDependencies also keeps every downloaded pack in
+# .git/ue-gitdeps and then extracts it, so the tree carries the archive and
+# its contents at once. --no-cache is therefore the default here now. A
+# number off a tool's banner is not the number on the disk.
 #
-# NOTHING IS BUILT HERE. Clone, then Setup.sh, then report. Compiling the
-# engine on 4 cores inside a 6-hour job is a separate question and pretending
-# otherwise would spend an hour to answer neither.
+# NOTHING IS BUILT HERE. Clone, Setup.sh, report. Compiling on 4 cores inside
+# a 6-hour job is a separate question.
 #
 # Every `run:` block is `bash -e`, which kills a step before a later line can
-# record anything. A stage that fails must still get its timing written down,
-# so every stage is `set +e` with an explicit rc.
+# record anything, so every stage is `set +e` with an explicit rc.
 #
 # The token never reaches the log: it is used inside a clone URL, and GitHub
 # masks secret values. Do not echo the URL.
@@ -26,8 +27,13 @@ on:
         description: 'engine branch or tag, e.g. 5.8'
         default: '5.8'
       setup_args:
-        description: 'extra Setup.sh args, e.g. --exclude=Android'
-        default: ''
+        description: 'Setup.sh args. --no-cache stops GitDependencies keeping
+          every downloaded pack alongside the files it extracted from it;
+          without it the tree passed 113 GB and was killed. Add
+          --exclude=Android --exclude=IOS --exclude=VisionOS to drop platforms
+          this project never targets (those folder names are measured, not
+          guessed -- see Reports/cloud_host/engine_deps_help.txt).'
+        default: '--no-cache'
       commit:
         description: 'push the report to the private repo'
         type: boolean
@@ -38,7 +44,7 @@ permissions: {}
 jobs:
   engine:
     runs-on: ubuntu-latest
-    timeout-minutes: 330        # under the 6-hour ceiling, with room to report
+    timeout-minutes: 330
     steps:
       - name: Is the secret present at all
         id: secret
@@ -101,7 +107,7 @@ jobs:
             tail -20 /tmp/clone.log
           fi
 
-      - name: Setup.sh -- the 30 GB of binary dependencies
+      - name: Setup.sh -- the binary dependencies
         id: setup
         if: ${{ steps.secret.outputs.ok == 'yes' && steps.clone.outputs.rc == '0' }}
         env:
@@ -115,8 +121,9 @@ jobs:
           PID=$!
 
           # A progress trail, so a job that dies still leaves a curve rather
-          # than a single "it failed". The floor is a guard, not an
-          # expectation: 116 GB against a stated 30 GB should never reach it.
+          # than a single "it failed". Run 33016837041 is why: its curve is
+          # the only reason we know the tree reached 113 GB rather than
+          # simply that Setup.sh stopped.
           KILLED=no
           while kill -0 "$PID" 2>/dev/null; do
             FREE=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
@@ -140,6 +147,8 @@ jobs:
           echo "size=${SZ:-0}"  >> "$GITHUB_OUTPUT"
           echo "killed=$KILLED" >> "$GITHUB_OUTPUT"
           echo "setup rc=$RC in ${SECS}s, tree ${SZ}MB, killed=$KILLED"
+          echo "--- the progress trail ---"
+          cat "$PROG"
 
       - name: Write the report and push it to the PRIVATE repo
         if: ${{ always() && steps.secret.outputs.ok == 'yes' }}
@@ -156,6 +165,7 @@ jobs:
           S_KILL: ${{ steps.setup.outputs.killed }}
           RUN_ID: ${{ github.run_id }}
           DO_COMMIT: ${{ inputs.commit }}
+          BRANCH: ${{ vars.TBS_BRANCH || 'claude/gateway-auth-fix-nr7k0b' }}
         run: |
           set +e
           OUT="Reports/cloud_host/engine_public_runner.txt"
@@ -167,7 +177,7 @@ jobs:
             echo "run        : ${RUN_ID}"
             echo "when       : $(date -u +%Y-%m-%dT%H:%M:%SZ)"
             echo "engine ref : ${REF}"
-            echo "setup args : ${ARGS:-<none, the full install>}"
+            echo "setup args : ${ARGS:-<none>}"
             echo "machine    : $(nproc) cores, $(free -g | awk '/^Mem:/{print $2}') GB ram"
             echo ""
             echo "== clone (git clone --depth 1) =="
@@ -185,16 +195,17 @@ jobs:
             echo ""
             echo "== VERDICT =="
             if [ "${S_KILL}" = "yes" ]; then
-              echo "DOES NOT FIT. Setup.sh was still running when free space"
-              echo "reached the floor."
+              echo "DOES NOT FIT at these arguments. Setup.sh was still running"
+              echo "when free space reached the floor. Compare the tree size"
+              echo "against Setup.sh's stated download size before concluding"
+              echo "anything about the engine: the difference is the cache."
             elif [ "${C_RC}" != "0" ]; then
               echo "NOT MEASURED past the clone. The clone itself failed, so"
               echo "nothing here says anything about whether the engine fits."
             elif [ "${S_RC}" = "0" ]; then
               echo "INSTALLED. This is the real installed size and the real"
-              echo "wall-clock cost of getting an engine onto a hosted runner."
-              echo "It says NOTHING about compiling it, and nothing about"
-              echo "persistence: this disk is destroyed when the job ends."
+              echo "wall-clock cost. It says NOTHING about compiling it, and"
+              echo "nothing about persistence: this disk dies with the job."
             else
               echo "Setup.sh FAILED for a reason that is not disk. Its own"
               echo "last lines follow."
@@ -222,15 +233,19 @@ jobs:
           fi
           H=$(git rev-parse --short HEAD)
           python3 Tools/record_commit.py "$H" \
-            "Unreal Engine install measured on the public runner (\`${OUT}\`), run ${RUN_ID}: clone rc=${C_RC} in ${C_SECS}s, Setup.sh rc=${S_RC} in ${S_SECS}s, tree ${S_SIZE}MB. Written by \`Runner\` \`engine.yml\`, not by a person."
+            "Unreal Engine install measured on the public runner (\`${OUT}\`), run ${RUN_ID}: clone rc=${C_RC} in ${C_SECS}s, Setup.sh rc=${S_RC} in ${S_SECS}s, tree ${S_SIZE}MB, killed=${S_KILL}. Written by \`Runner\` \`engine.yml\`, not by a person."
           if [ $? -ne 0 ]; then
             echo "record_commit failed -- not pushing an unrecorded commit."
             exit 1
           fi
           git add Team/CHANGELOG.md
           git commit -m "changelog: record ${H}"
-          git push origin HEAD:"${{ vars.TBS_BRANCH || 'claude/gateway-auth-fix-nr7k0b' }}"
-          echo "push rc=$?"
+
+          # Run 33016837041 measured everything, committed it, and then lost
+          # the lot to a rejected push because a session pushed to the same
+          # branch during the job. A push is the delivery.
+          bash "${GITHUB_WORKSPACE}/push-with-merge.sh" "${BRANCH}"
+          echo "push script rc=$?"
 
       - name: Verdict
         if: ${{ always() }}
@@ -245,7 +260,7 @@ jobs:
             exit 1
           fi
           if [ "${{ steps.setup.outputs.rc }}" != "0" ]; then
-            echo "Setup.sh rc=${{ steps.setup.outputs.rc }} -- see the report."
+            echo "Setup.sh rc=${{ steps.setup.outputs.rc }}, killed=${{ steps.setup.outputs.killed }}, tree ${{ steps.setup.outputs.size }} MB -- see the report."
             exit 1
           fi
           echo "engine installed: ${{ steps.setup.outputs.size }} MB in ${{ steps.setup.outputs.secs }}s"
