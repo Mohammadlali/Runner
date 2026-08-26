@@ -1,0 +1,251 @@
+# Install Unreal Engine on a PUBLIC repository's runner, and time it.
+#
+# The question is only "how long, and does it fit". It was already settled
+# that it does NOT fit a private runner: Setup.sh wants 31113.5 MiB across
+# 134334 files, and the tree hit 40 GB with 3 GB free in 196 s against 43 GB
+# total (Claud-Cloud-Project, run 33000932367). This machine has 116 GB free
+# and 15 GB of RAM, measured, so disk is no longer the constraint and the
+# honest measurement is the FULL install with no --exclude at all.
+#
+# NOTHING IS BUILT HERE. Clone, then Setup.sh, then report. Compiling the
+# engine on 4 cores inside a 6-hour job is a separate question and pretending
+# otherwise would spend an hour to answer neither.
+#
+# Every `run:` block is `bash -e`, which kills a step before a later line can
+# record anything. A stage that fails must still get its timing written down,
+# so every stage is `set +e` with an explicit rc.
+#
+# The token never reaches the log: it is used inside a clone URL, and GitHub
+# masks secret values. Do not echo the URL.
+name: engine
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'engine branch or tag, e.g. 5.8'
+        default: '5.8'
+      setup_args:
+        description: 'extra Setup.sh args, e.g. --exclude=Android'
+        default: ''
+      commit:
+        description: 'push the report to the private repo'
+        type: boolean
+        default: true
+
+permissions: {}
+
+jobs:
+  engine:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330        # under the 6-hour ceiling, with room to report
+    steps:
+      - name: Is the secret present at all
+        id: secret
+        env:
+          TOK: ${{ secrets.TBS_PRIVATE_TOKEN }}
+        run: |
+          set +e
+          if [ -z "$TOK" ]; then
+            echo "ok=no" >> "$GITHUB_OUTPUT"
+            echo "TBS_PRIVATE_TOKEN is NOT set on this repository."
+          else
+            echo "ok=yes" >> "$GITHUB_OUTPUT"
+            echo "secret present"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.secret.outputs.ok == 'yes'
+        with:
+          repository: Mohammadlali/Claud-Cloud-Project
+          ref: ${{ vars.TBS_BRANCH || 'claude/gateway-auth-fix-nr7k0b' }}
+          token: ${{ secrets.TBS_PRIVATE_TOKEN }}
+          fetch-depth: 0
+          path: work
+
+      - name: Make room, and say how much there was
+        if: steps.secret.outputs.ok == 'yes'
+        run: |
+          set +e
+          echo "before : $(df -BG --output=avail / | tail -1 | tr -d ' ')"
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+                      /usr/local/share/boost /usr/local/.ghcup \
+                      /usr/share/swift /opt/hostedtoolcache 2>/dev/null
+          echo "after  : $(df -BG --output=avail / | tail -1 | tr -d ' ')"
+          sudo mkdir -p /mnt/ue
+          sudo chown "$(id -u):$(id -g)" /mnt/ue
+          echo "cores  : $(nproc)"
+          echo "ram    : $(free -g | awk '/^Mem:/{print $2}') GB"
+
+      - name: Clone the engine
+        id: clone
+        if: steps.secret.outputs.ok == 'yes'
+        env:
+          TOK: ${{ secrets.TBS_PRIVATE_TOKEN }}
+          REF: ${{ inputs.ref }}
+        run: |
+          set +e
+          BEGAN=$(date +%s)
+          git clone --depth 1 --branch "$REF" \
+            "https://x-access-token:${TOK}@github.com/EpicGames/UnrealEngine.git" \
+            /mnt/ue > /tmp/clone.log 2>&1
+          RC=$?
+          SECS=$(( $(date +%s) - BEGAN ))
+          echo "rc=$RC"     >> "$GITHUB_OUTPUT"
+          echo "secs=$SECS" >> "$GITHUB_OUTPUT"
+          SZ=$(du -sm /mnt/ue 2>/dev/null | cut -f1)
+          echo "size=${SZ:-0}" >> "$GITHUB_OUTPUT"
+          echo "clone rc=$RC in ${SECS}s, tree ${SZ}MB"
+          if [ "$RC" -ne 0 ]; then
+            echo "--- last 20 lines of the clone log ---"
+            tail -20 /tmp/clone.log
+          fi
+
+      - name: Setup.sh -- the 30 GB of binary dependencies
+        id: setup
+        if: ${{ steps.secret.outputs.ok == 'yes' && steps.clone.outputs.rc == '0' }}
+        env:
+          ARGS: ${{ inputs.setup_args }}
+        run: |
+          set +e
+          PROG=/tmp/progress.txt
+          : > "$PROG"
+          BEGAN=$(date +%s)
+          ( cd /mnt/ue && ./Setup.sh $ARGS ) > /tmp/setup.log 2>&1 &
+          PID=$!
+
+          # A progress trail, so a job that dies still leaves a curve rather
+          # than a single "it failed". The floor is a guard, not an
+          # expectation: 116 GB against a stated 30 GB should never reach it.
+          KILLED=no
+          while kill -0 "$PID" 2>/dev/null; do
+            FREE=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+            SZ=$(du -sm /mnt/ue 2>/dev/null | cut -f1)
+            EL=$(( $(date +%s) - BEGAN ))
+            echo "t=${EL}s free=${FREE}G tree=${SZ}MB" >> "$PROG"
+            if [ "${FREE:-99}" -lt 6 ]; then
+              echo "t=${EL}s FLOOR HIT at ${FREE}G -- killing Setup.sh" >> "$PROG"
+              kill -9 "$PID" 2>/dev/null
+              KILLED=yes
+              break
+            fi
+            sleep 30
+          done
+          wait "$PID" 2>/dev/null
+          RC=$?
+          SECS=$(( $(date +%s) - BEGAN ))
+          SZ=$(du -sm /mnt/ue 2>/dev/null | cut -f1)
+          echo "rc=$RC"         >> "$GITHUB_OUTPUT"
+          echo "secs=$SECS"     >> "$GITHUB_OUTPUT"
+          echo "size=${SZ:-0}"  >> "$GITHUB_OUTPUT"
+          echo "killed=$KILLED" >> "$GITHUB_OUTPUT"
+          echo "setup rc=$RC in ${SECS}s, tree ${SZ}MB, killed=$KILLED"
+
+      - name: Write the report and push it to the PRIVATE repo
+        if: ${{ always() && steps.secret.outputs.ok == 'yes' }}
+        working-directory: work
+        env:
+          REF:    ${{ inputs.ref }}
+          ARGS:   ${{ inputs.setup_args }}
+          C_RC:   ${{ steps.clone.outputs.rc }}
+          C_SECS: ${{ steps.clone.outputs.secs }}
+          C_SIZE: ${{ steps.clone.outputs.size }}
+          S_RC:   ${{ steps.setup.outputs.rc }}
+          S_SECS: ${{ steps.setup.outputs.secs }}
+          S_SIZE: ${{ steps.setup.outputs.size }}
+          S_KILL: ${{ steps.setup.outputs.killed }}
+          RUN_ID: ${{ github.run_id }}
+          DO_COMMIT: ${{ inputs.commit }}
+        run: |
+          set +e
+          OUT="Reports/cloud_host/engine_public_runner.txt"
+          mkdir -p Reports/cloud_host
+          {
+            echo "Installing Unreal Engine on a PUBLIC repository's hosted runner."
+            echo ""
+            echo "instrument : Mohammadlali/Runner .github/workflows/engine.yml"
+            echo "run        : ${RUN_ID}"
+            echo "when       : $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "engine ref : ${REF}"
+            echo "setup args : ${ARGS:-<none, the full install>}"
+            echo "machine    : $(nproc) cores, $(free -g | awk '/^Mem:/{print $2}') GB ram"
+            echo ""
+            echo "== clone (git clone --depth 1) =="
+            echo "rc         : ${C_RC:-<step did not run>}"
+            echo "seconds    : ${C_SECS:-<none>}"
+            echo "tree MB    : ${C_SIZE:-<none>}"
+            echo ""
+            echo "== Setup.sh (binary dependencies) =="
+            echo "rc         : ${S_RC:-<step did not run>}"
+            echo "seconds    : ${S_SECS:-<none>}"
+            echo "tree MB    : ${S_SIZE:-<none>}"
+            echo "killed     : ${S_KILL:-<none>}   (disk floor 6G)"
+            echo ""
+            echo "disk free now : $(df -BG --output=avail / | tail -1 | tr -d ' ')"
+            echo ""
+            echo "== VERDICT =="
+            if [ "${S_KILL}" = "yes" ]; then
+              echo "DOES NOT FIT. Setup.sh was still running when free space"
+              echo "reached the floor."
+            elif [ "${C_RC}" != "0" ]; then
+              echo "NOT MEASURED past the clone. The clone itself failed, so"
+              echo "nothing here says anything about whether the engine fits."
+            elif [ "${S_RC}" = "0" ]; then
+              echo "INSTALLED. This is the real installed size and the real"
+              echo "wall-clock cost of getting an engine onto a hosted runner."
+              echo "It says NOTHING about compiling it, and nothing about"
+              echo "persistence: this disk is destroyed when the job ends."
+            else
+              echo "Setup.sh FAILED for a reason that is not disk. Its own"
+              echo "last lines follow."
+            fi
+            echo ""
+            echo "== progress trail, every 30s =="
+            cat /tmp/progress.txt 2>/dev/null || echo "(none)"
+            echo ""
+            echo "== last 40 lines of Setup.sh =="
+            tail -40 /tmp/setup.log 2>/dev/null || echo "(none)"
+          } > "$OUT"
+          echo "wrote $OUT"
+
+          if [ "$DO_COMMIT" != "true" ]; then
+            echo "commit not requested -- stopping."
+            exit 0
+          fi
+          git config user.name  "tbs-runner"
+          git config user.email "noreply@github.com"
+          git add "$OUT"
+          git commit -m "engine: install measured on the public runner, run ${RUN_ID}"
+          if [ $? -ne 0 ]; then
+            echo "nothing to commit."
+            exit 0
+          fi
+          H=$(git rev-parse --short HEAD)
+          python3 Tools/record_commit.py "$H" \
+            "Unreal Engine install measured on the public runner (\`${OUT}\`), run ${RUN_ID}: clone rc=${C_RC} in ${C_SECS}s, Setup.sh rc=${S_RC} in ${S_SECS}s, tree ${S_SIZE}MB. Written by \`Runner\` \`engine.yml\`, not by a person."
+          if [ $? -ne 0 ]; then
+            echo "record_commit failed -- not pushing an unrecorded commit."
+            exit 1
+          fi
+          git add Team/CHANGELOG.md
+          git commit -m "changelog: record ${H}"
+          git push origin HEAD:"${{ vars.TBS_BRANCH || 'claude/gateway-auth-fix-nr7k0b' }}"
+          echo "push rc=$?"
+
+      - name: Verdict
+        if: ${{ always() }}
+        run: |
+          set +e
+          if [ "${{ steps.secret.outputs.ok }}" != "yes" ]; then
+            echo "NOT MEASURED. Nothing ran, and that is not a success."
+            exit 1
+          fi
+          if [ "${{ steps.clone.outputs.rc }}" != "0" ]; then
+            echo "clone rc=${{ steps.clone.outputs.rc }} -- see the report."
+            exit 1
+          fi
+          if [ "${{ steps.setup.outputs.rc }}" != "0" ]; then
+            echo "Setup.sh rc=${{ steps.setup.outputs.rc }} -- see the report."
+            exit 1
+          fi
+          echo "engine installed: ${{ steps.setup.outputs.size }} MB in ${{ steps.setup.outputs.secs }}s"
