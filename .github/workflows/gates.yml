@@ -11,6 +11,11 @@
 #   * secrets are not given to forks, and workflow_dispatch here requires
 #     write access, so TBS_PRIVATE_TOKEN is not reachable from this page.
 #
+# THIS REPO IS NEVER CHECKED OUT. Only the private one is, into `work/`. Any
+# helper a step calls must therefore live in the PRIVATE repo -- run
+# 33019109333 failed instantly because it called a script sitting here in
+# Runner, which was not on the runner's disk at all.
+#
 # Every `run:` block is `bash -e`. A failing command kills the step before a
 # later line can record its exit code, which is exactly what a gate run must
 # not do -- a red gate suite MUST still get its transcript committed. Hence
@@ -26,11 +31,11 @@
 # name its own hash, so the transcript is committed first and a follow-up
 # `changelog: record <hash>` commit is written by Tools/record_commit.py.
 #
-# The bare `git push` this file used to end on was the same bug that threw
-# away ten minutes of the engine run's measurement (Runner run 33016837041):
-# a session pushed to the branch mid-job, the push was rejected, and `set +e`
-# reported the step a success. It now goes through push-with-merge.sh, and a
-# failed delivery FAILS the job instead of being reported as 25 gates green.
+# The bare `git push` this file used to end on threw away ten minutes of the
+# engine run's measurement (run 33016837041): a session pushed to the branch
+# mid-job, the push was rejected, and `set +e` reported the step a success.
+# Delivery now goes through Tools/push_with_merge.sh, and a failed delivery
+# FAILS the job instead of being reported as 25 gates green.
 name: gates
 
 on:
@@ -103,6 +108,12 @@ jobs:
             echo "delivered=no" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          if [ ! -f Tools/push_with_merge.sh ]; then
+            echo "Tools/push_with_merge.sh is missing from the checkout."
+            echo "NOT MEASURED as a delivery failure -- the helper is absent."
+            echo "delivered=no" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
           git config user.name  "tbs-runner"
           git config user.email "noreply@github.com"
 
@@ -129,7 +140,7 @@ jobs:
           git add Team/CHANGELOG.md
           git commit -m "changelog: record ${H}"
 
-          bash "${GITHUB_WORKSPACE}/push-with-merge.sh" "${BRANCH}"
+          bash Tools/push_with_merge.sh "${BRANCH}"
           if [ $? -ne 0 ]; then
             echo "delivered=no" >> "$GITHUB_OUTPUT"
             echo "THE TRANSCRIPT DID NOT REACH THE REPOSITORY."
