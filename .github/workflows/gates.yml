@@ -6,7 +6,8 @@
 #   * a public repository's job log is world-readable, so the gate output is
 #     NOT printed. Tools/run_gates.py writes every gate's full output to a
 #     transcript file and prints only "which command, pass or fail". The
-#     transcript is pushed to the PRIVATE repo.
+#     transcript is pushed to the PRIVATE repo. Any step added here that
+#     prints tool output breaks that, so do not add one.
 #   * secrets are not given to forks, and workflow_dispatch here requires
 #     write access, so TBS_PRIVATE_TOKEN is not reachable from this page.
 #
@@ -15,11 +16,15 @@
 # not do -- a red gate suite MUST still get its transcript committed. Hence
 # `set +e` and an explicit rc, not `set -e` with hope.
 #
-# Run 1 of this workflow failed three times over for ONE cause: the secret
-# guard exited 1, so checkout never ran, and two later `always()` steps then
-# reported a missing directory and an empty exit code. Three error lines, one
-# fact. The guard now sets an OUTPUT and every later step is conditioned on
-# it, so a missing secret produces exactly one message that names itself.
+# Run 1 failed three times over for ONE cause: the secret guard exited 1, so
+# checkout never ran, and two later always() steps then reported a missing
+# directory and an empty exit code. The guard now sets an OUTPUT instead.
+#
+# Run 3 was green and STILL left the private repo red: check_changelog does
+# not care whether a human or a workflow made a commit, so this job's own
+# transcript commit was unrecorded and failed the next run. A commit cannot
+# name its own hash, so the transcript is committed first and a follow-up
+# `changelog: record <hash>` commit is written by Tools/record_commit.py.
 name: gates
 
 on:
@@ -76,12 +81,14 @@ jobs:
           echo "out=$OUT" >> "$GITHUB_OUTPUT"
           echo "gates exit code : $RC"
 
-      - name: Push the transcript to the PRIVATE repo
+      - name: Push the transcript, and record it, to the PRIVATE repo
         if: ${{ always() && steps.secret.outputs.ok == 'yes' && inputs.commit }}
         working-directory: work
+        env:
+          OUT: ${{ steps.run.outputs.out }}
+          RC:  ${{ steps.run.outputs.rc }}
         run: |
           set +e
-          OUT="${{ steps.run.outputs.out }}"
           if [ ! -f "$OUT" ]; then
             echo "no transcript at '${OUT}' -- the run died before writing one."
             echo "That is a real answer and it is NOT 'the gates passed'."
@@ -89,8 +96,28 @@ jobs:
           fi
           git config user.name  "tbs-runner"
           git config user.email "noreply@github.com"
+
           git add "$OUT"
-          git commit -m "gates: transcript from the public runner, rc=${{ steps.run.outputs.rc }}"
+          git commit -m "gates: transcript from the public runner, rc=${RC}"
+          if [ $? -ne 0 ]; then
+            echo "nothing to commit -- stopping before an empty push."
+            exit 0
+          fi
+          H=$(git rev-parse --short HEAD)
+          echo "transcript commit : $H"
+
+          # A commit cannot name its own hash. The follow-up entry is what
+          # keeps check_changelog green on the NEXT run of this workflow.
+          python3 Tools/record_commit.py "$H" \
+            "the 25-gate transcript from the public runner (\`${OUT}\`), rc=${RC}. Written by \`Runner\` \`gates.yml\`, not by a person. Record only."
+          if [ $? -ne 0 ]; then
+            echo "record_commit failed -- pushing the transcript anyway would"
+            echo "leave the changelog incomplete and the next run red. Stopping."
+            exit 1
+          fi
+          git add Team/CHANGELOG.md
+          git commit -m "changelog: record ${H}"
+
           git push origin HEAD:"${{ vars.TBS_BRANCH || 'claude/gateway-auth-fix-nr7k0b' }}"
           echo "push rc=$?"
 
@@ -101,9 +128,8 @@ jobs:
           if [ "${{ steps.secret.outputs.ok }}" != "yes" ]; then
             echo "NOT MEASURED. The gates did not run, and that is not a pass."
             echo ""
-            echo "Add a repository secret named TBS_PRIVATE_TOKEN: a"
-            echo "fine-grained personal access token scoped to"
-            echo "Mohammadlali/Claud-Cloud-Project ONLY, Contents: read+write."
+            echo "Add a repository secret named TBS_PRIVATE_TOKEN with access"
+            echo "to Mohammadlali/Claud-Cloud-Project, Contents: read+write."
             exit 1
           fi
           RC="${{ steps.run.outputs.rc }}"
