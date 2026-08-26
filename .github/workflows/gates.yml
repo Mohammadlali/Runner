@@ -25,6 +25,12 @@
 # transcript commit was unrecorded and failed the next run. A commit cannot
 # name its own hash, so the transcript is committed first and a follow-up
 # `changelog: record <hash>` commit is written by Tools/record_commit.py.
+#
+# The bare `git push` this file used to end on was the same bug that threw
+# away ten minutes of the engine run's measurement (Runner run 33016837041):
+# a session pushed to the branch mid-job, the push was rejected, and `set +e`
+# reported the step a success. It now goes through push-with-merge.sh, and a
+# failed delivery FAILS the job instead of being reported as 25 gates green.
 name: gates
 
 on:
@@ -82,16 +88,19 @@ jobs:
           echo "gates exit code : $RC"
 
       - name: Push the transcript, and record it, to the PRIVATE repo
+        id: deliver
         if: ${{ always() && steps.secret.outputs.ok == 'yes' && inputs.commit }}
         working-directory: work
         env:
-          OUT: ${{ steps.run.outputs.out }}
-          RC:  ${{ steps.run.outputs.rc }}
+          OUT:    ${{ steps.run.outputs.out }}
+          RC:     ${{ steps.run.outputs.rc }}
+          BRANCH: ${{ vars.TBS_BRANCH || 'claude/gateway-auth-fix-nr7k0b' }}
         run: |
           set +e
           if [ ! -f "$OUT" ]; then
             echo "no transcript at '${OUT}' -- the run died before writing one."
             echo "That is a real answer and it is NOT 'the gates passed'."
+            echo "delivered=no" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           git config user.name  "tbs-runner"
@@ -101,6 +110,7 @@ jobs:
           git commit -m "gates: transcript from the public runner, rc=${RC}"
           if [ $? -ne 0 ]; then
             echo "nothing to commit -- stopping before an empty push."
+            echo "delivered=no" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           H=$(git rev-parse --short HEAD)
@@ -113,13 +123,19 @@ jobs:
           if [ $? -ne 0 ]; then
             echo "record_commit failed -- pushing the transcript anyway would"
             echo "leave the changelog incomplete and the next run red. Stopping."
+            echo "delivered=no" >> "$GITHUB_OUTPUT"
             exit 1
           fi
           git add Team/CHANGELOG.md
           git commit -m "changelog: record ${H}"
 
-          git push origin HEAD:"${{ vars.TBS_BRANCH || 'claude/gateway-auth-fix-nr7k0b' }}"
-          echo "push rc=$?"
+          bash "${GITHUB_WORKSPACE}/push-with-merge.sh" "${BRANCH}"
+          if [ $? -ne 0 ]; then
+            echo "delivered=no" >> "$GITHUB_OUTPUT"
+            echo "THE TRANSCRIPT DID NOT REACH THE REPOSITORY."
+            exit 1
+          fi
+          echo "delivered=yes" >> "$GITHUB_OUTPUT"
 
       - name: Verdict
         if: ${{ always() }}
@@ -141,4 +157,14 @@ jobs:
             echo "gate suite exit code $RC -- not green."
             exit 1
           fi
-          echo "25 gates green"
+          # A green suite whose transcript never arrived is a claim with no
+          # evidence behind it, which is the one thing this project does not
+          # accept. Say so rather than printing "25 gates green".
+          if [ "${{ inputs.commit }}" = "true" ] \
+             && [ "${{ steps.deliver.outputs.delivered }}" != "yes" ]; then
+            echo "25 gates passed, but THE TRANSCRIPT WAS NOT DELIVERED."
+            echo "There is no record of this run in the repository, so it does"
+            echo "not count. See this job's log for what the delivery hit."
+            exit 1
+          fi
+          echo "25 gates green, transcript delivered"
