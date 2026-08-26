@@ -1,0 +1,36 @@
+# What this runner actually is. Prints only; commits nothing.
+#
+# Re-runnable on purpose: the image changes under us, and a number that was
+# measured in August is not a number that is true in November.
+name: spec
+
+on:
+  workflow_dispatch:
+
+jobs:
+  spec:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Measure the machine
+        run: |
+          set +e
+          echo "repo         : $GITHUB_REPOSITORY"
+          echo "visibility   : ${{ github.event.repository.visibility }}"
+          echo "runner image : $ImageOS  $ImageVersion"
+          echo "arch         : $(uname -m)"
+          echo "nproc        : $(nproc)"
+          grep -m1 'model name' /proc/cpuinfo
+          echo ""
+          free -h
+          echo ""
+          echo "== disk before cleanup =="
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+                      /usr/local/share/boost /usr/local/.ghcup \
+                      /usr/share/swift /opt/hostedtoolcache 2>/dev/null
+          echo "== disk after cleanup =="
+          df -h /
+          echo "free_root_gb : $(df -BG --output=avail / | tail -1 | tr -dc '0-9')"
+          echo "python       : $(python3 -V 2>&1)"
+          echo "git          : $(git --version)"
+          echo "done"
