@@ -1,0 +1,354 @@
+# Epic's PREBUILT Linux Unreal Engine, unpacked on a hosted runner, and then
+# actually started.
+#
+# WHY THIS CHANGES THE PROBLEM. Everything measured so far downloads engine
+# SOURCE and its dependencies -- 86 GB at best, and still no editor, because a
+# Linux UE from source has to be compiled and nobody has ever measured that
+# compile. Epic publishes a prebuilt Linux binary release:
+# Linux_Unreal_Engine_5.8.2.zip, 37.08 GB, dated 2026-08-25, from
+# unrealengine.com/linux. If it unpacks and starts here, the compile question
+# disappears entirely.
+#
+# THE URL IS A CREDENTIAL AND IT IS NOT IN THIS FILE. It is a presigned S3
+# link that expires within the hour and, while live, serves Epic's engine
+# binaries to anyone holding it. This repository is PUBLIC, and workflow files
+# and dispatch inputs are both world-readable here -- a repository SECRET is
+# the only one of the three that GitHub masks in logs. Hence
+# secrets.TBS_ENGINE_ZIP_URL.
+#
+# ARITHMETIC BEFORE SPENDING HALF AN HOUR ON IT: the runner has ~116 GB free.
+# The zip is 37 GB and Epic's own page asks for ~60 GB free to install, so the
+# peak is roughly 97 GB with both present. It fits, but not by much, so the
+# zip is DELETED the moment extraction succeeds and the free space is recorded
+# on both sides of that.
+#
+# Every `run:` block is `bash -e`, which kills a step before a later line can
+# record anything, so every stage is `set +e` with an explicit rc.
+name: prebuilt
+
+on:
+  workflow_dispatch:
+    inputs:
+      boot:
+        description: 'after unpacking, try to start the editor on this project'
+        type: boolean
+        default: true
+      commit:
+        description: 'push the report to the private repo'
+        type: boolean
+        default: true
+
+permissions: {}
+
+jobs:
+  prebuilt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - name: Are both secrets present
+        id: secret
+        env:
+          TOK: ${{ secrets.TBS_PRIVATE_TOKEN }}
+          ZIP: ${{ secrets.TBS_ENGINE_ZIP_URL }}
+        run: |
+          set +e
+          OK=yes
+          if [ -z "$TOK" ]; then
+            echo "TBS_PRIVATE_TOKEN is NOT set."
+            OK=no
+          fi
+          if [ -z "$ZIP" ]; then
+            echo "TBS_ENGINE_ZIP_URL is NOT set. Add it as a repository"
+            echo "secret: the presigned download URL for Epic's"
+            echo "Linux_Unreal_Engine_5.8.2.zip. It is a credential and it"
+            echo "expires, so it does not belong in a workflow file or a"
+            echo "dispatch input on a public repository."
+            OK=no
+          fi
+          echo "ok=$OK" >> "$GITHUB_OUTPUT"
+          [ "$OK" = "yes" ] && echo "both secrets present"
+
+      - uses: actions/checkout@v4
+        if: steps.secret.outputs.ok == 'yes'
+        with:
+          repository: Mohammadlali/Claud-Cloud-Project
+          ref: ${{ vars.TBS_BRANCH || 'claude/gateway-auth-fix-nr7k0b' }}
+          token: ${{ secrets.TBS_PRIVATE_TOKEN }}
+          fetch-depth: 0
+          path: work
+
+      - name: Make room
+        id: room
+        if: steps.secret.outputs.ok == 'yes'
+        run: |
+          set +e
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+                      /usr/local/share/boost /usr/local/.ghcup \
+                      /usr/share/swift /opt/hostedtoolcache 2>/dev/null
+          FREE=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+          echo "free=$FREE" >> "$GITHUB_OUTPUT"
+          echo "free after cleanup : ${FREE} GB"
+          sudo mkdir -p /mnt/ue
+          sudo chown "$(id -u):$(id -g)" /mnt/ue
+
+      - name: Download the prebuilt engine
+        id: dl
+        if: steps.secret.outputs.ok == 'yes'
+        env:
+          ZIP: ${{ secrets.TBS_ENGINE_ZIP_URL }}
+        run: |
+          set +e
+          BEGAN=$(date +%s)
+          # --fail so an expired signature is an error rather than a saved
+          # XML error page that unzip later calls corrupt. -sS keeps the
+          # progress meter out of a public log without hiding errors.
+          curl -L --fail -sS --max-time 7200 -o /mnt/ue.zip "$ZIP"
+          RC=$?
+          SECS=$(( $(date +%s) - BEGAN ))
+          MB=$(du -sm /mnt/ue.zip 2>/dev/null | cut -f1)
+          echo "rc=$RC"       >> "$GITHUB_OUTPUT"
+          echo "secs=$SECS"   >> "$GITHUB_OUTPUT"
+          echo "mb=${MB:-0}"  >> "$GITHUB_OUTPUT"
+          echo "download rc=$RC in ${SECS}s, ${MB}MB"
+          if [ "$RC" -ne 0 ]; then
+            echo "The link is presigned and short-lived. rc 22 with a 403 is"
+            echo "an EXPIRED signature, which is not the same answer as a"
+            echo "network failure. Get a fresh URL and re-run."
+          fi
+
+      - name: Unzip it, then delete the zip
+        id: unzip
+        if: ${{ steps.secret.outputs.ok == 'yes' && steps.dl.outputs.rc == '0' }}
+        run: |
+          set +e
+          BEGAN=$(date +%s)
+          unzip -q /mnt/ue.zip -d /mnt/ue
+          RC=$?
+          SECS=$(( $(date +%s) - BEGAN ))
+          echo "unzip rc=$RC in ${SECS}s"
+          FREE_BEFORE_RM=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+          rm -f /mnt/ue.zip
+          FREE_AFTER_RM=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+          MB=$(du -sm /mnt/ue 2>/dev/null | cut -f1)
+          echo "rc=$RC"           >> "$GITHUB_OUTPUT"
+          echo "secs=$SECS"       >> "$GITHUB_OUTPUT"
+          echo "mb=${MB:-0}"      >> "$GITHUB_OUTPUT"
+          echo "tight=$FREE_BEFORE_RM" >> "$GITHUB_OUTPUT"
+          echo "free=$FREE_AFTER_RM"   >> "$GITHUB_OUTPUT"
+          echo "extracted ${MB}MB; free was ${FREE_BEFORE_RM}G with the zip"
+          echo "still there, ${FREE_AFTER_RM}G after deleting it"
+          echo "--- what the archive actually contains at the top ---"
+          ls -1 /mnt/ue | head -20
+
+      - name: Find the editor
+        id: find
+        if: ${{ steps.secret.outputs.ok == 'yes' && steps.unzip.outputs.rc == '0' }}
+        run: |
+          set +e
+          # Do not assume the zip has no wrapping directory -- look for the
+          # binary rather than guessing the layout.
+          CMD=$(find /mnt/ue -maxdepth 6 -type f -name 'UnrealEditor-Cmd' \
+                  2>/dev/null | head -1)
+          echo "editor=$CMD" >> "$GITHUB_OUTPUT"
+          if [ -z "$CMD" ]; then
+            echo "NO UnrealEditor-Cmd ANYWHERE in the extracted tree."
+            echo "found=no" >> "$GITHUB_OUTPUT"
+            echo "--- directories two levels down, for the record ---"
+            find /mnt/ue -maxdepth 2 -type d | head -30
+            exit 0
+          fi
+          echo "found=yes" >> "$GITHUB_OUTPUT"
+          echo "editor : $CMD"
+          ls -la "$CMD"
+          chmod +x "$CMD" 2>/dev/null
+          ENGDIR=$(dirname "$(dirname "$(dirname "$(dirname "$CMD")")")")
+          echo "engine=$ENGDIR" >> "$GITHUB_OUTPUT"
+          echo "engine root : $ENGDIR"
+
+      - name: Start it on this project
+        id: boot
+        if: ${{ steps.secret.outputs.ok == 'yes' && steps.find.outputs.found == 'yes' && inputs.boot }}
+        env:
+          CMD: ${{ steps.find.outputs.editor }}
+        run: |
+          set +e
+          PROJ="$GITHUB_WORKSPACE/work/TehranBlindSpot.uproject"
+          ls -la "$PROJ"
+          BEGAN=$(date +%s)
+          # -NullRHI because there is no GPU here; this asks only whether the
+          # editor STARTS and runs the project's own data-only probe, not
+          # whether anything renders. Those are different questions and this
+          # step answers the first one only.
+          timeout 1800 "$CMD" "$PROJ" \
+            -ExecutePythonScript="$GITHUB_WORKSPACE/work/Tools/probe_boot.py" \
+            -unattended -nopause -nosplash -NullRHI -stdout \
+            -abslog=/tmp/boot.log > /tmp/boot.stdout 2>&1
+          RC=$?
+          SECS=$(( $(date +%s) - BEGAN ))
+          echo "rc=$RC"     >> "$GITHUB_OUTPUT"
+          echo "secs=$SECS" >> "$GITHUB_OUTPUT"
+          echo "boot rc=$RC in ${SECS}s"
+          TBS=$(grep -c '^##TBS##' /tmp/boot.log /tmp/boot.stdout 2>/dev/null \
+                | awk -F: '{s+=$2} END {print s+0}')
+          echo "tbs=$TBS" >> "$GITHUB_OUTPUT"
+          echo "##TBS## lines produced : $TBS"
+          echo "--- last 60 lines the editor printed ---"
+          tail -60 /tmp/boot.stdout 2>/dev/null
+          echo "--- last 40 lines of its own log ---"
+          tail -40 /tmp/boot.log 2>/dev/null
+
+      - name: Write the report and push it to the PRIVATE repo
+        id: deliver
+        if: ${{ always() && steps.secret.outputs.ok == 'yes' }}
+        working-directory: work
+        env:
+          RUN_ID:  ${{ github.run_id }}
+          FREE0:   ${{ steps.room.outputs.free }}
+          D_RC:    ${{ steps.dl.outputs.rc }}
+          D_SECS:  ${{ steps.dl.outputs.secs }}
+          D_MB:    ${{ steps.dl.outputs.mb }}
+          U_RC:    ${{ steps.unzip.outputs.rc }}
+          U_SECS:  ${{ steps.unzip.outputs.secs }}
+          U_MB:    ${{ steps.unzip.outputs.mb }}
+          U_TIGHT: ${{ steps.unzip.outputs.tight }}
+          U_FREE:  ${{ steps.unzip.outputs.free }}
+          F_FOUND: ${{ steps.find.outputs.found }}
+          F_CMD:   ${{ steps.find.outputs.editor }}
+          B_RC:    ${{ steps.boot.outputs.rc }}
+          B_SECS:  ${{ steps.boot.outputs.secs }}
+          B_TBS:   ${{ steps.boot.outputs.tbs }}
+          DO_COMMIT: ${{ inputs.commit }}
+          BRANCH:  ${{ vars.TBS_BRANCH || 'claude/gateway-auth-fix-nr7k0b' }}
+        run: |
+          set +e
+          OUT="Reports/cloud_host/engine_prebuilt_${RUN_ID}.txt"
+          mkdir -p Reports/cloud_host
+          {
+            echo "Epic's PREBUILT Linux Unreal Engine on a public hosted runner."
+            echo ""
+            echo "instrument : Mohammadlali/Runner .github/workflows/prebuilt.yml"
+            echo "run        : ${RUN_ID}"
+            echo "when       : $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "source     : Linux_Unreal_Engine_5.8.2.zip, 37.08 GB,"
+            echo "             dated 2026-08-25, unrealengine.com/linux"
+            echo "machine    : $(nproc) cores, $(free -g | awk '/^Mem:/{print $2}') GB ram"
+            echo "free at start of work : ${FREE0:-<none>} GB"
+            echo ""
+            echo "== download =="
+            echo "rc         : ${D_RC:-<step did not run>}"
+            echo "seconds    : ${D_SECS:-<none>}"
+            echo "MB         : ${D_MB:-<none>}"
+            echo ""
+            echo "== unzip =="
+            echo "rc         : ${U_RC:-<step did not run>}"
+            echo "seconds    : ${U_SECS:-<none>}"
+            echo "tree MB    : ${U_MB:-<none>}"
+            echo "free with the zip still present : ${U_TIGHT:-<none>} GB"
+            echo "free after deleting the zip     : ${U_FREE:-<none>} GB"
+            echo ""
+            echo "== the editor binary =="
+            echo "found      : ${F_FOUND:-<step did not run>}"
+            echo "path       : ${F_CMD:-<none>}"
+            echo ""
+            echo "== boot, -NullRHI, running Tools/probe_boot.py =="
+            echo "rc         : ${B_RC:-<step did not run>}"
+            echo "seconds    : ${B_SECS:-<none>}"
+            echo "##TBS## lines : ${B_TBS:-<none>}"
+            echo ""
+            echo "== VERDICT =="
+            if [ "${D_RC}" != "0" ]; then
+              echo "NOT MEASURED past the download. A presigned URL that has"
+              echo "expired reports rc 22, and that is not the same answer as"
+              echo "'the engine does not fit' or 'the engine does not run'."
+            elif [ "${U_RC}" != "0" ]; then
+              echo "The archive did not extract. Check the free-space numbers"
+              echo "above before blaming the archive."
+            elif [ "${F_FOUND}" != "yes" ]; then
+              echo "Extracted, but there is NO UnrealEditor-Cmd in the tree."
+              echo "Whatever this zip is, it is not a runnable editor."
+            elif [ "${B_RC}" = "0" ]; then
+              echo "THE EDITOR STARTS ON A GITHUB RUNNER. First time in this"
+              echo "project that Unreal has run anywhere but the laptop."
+              echo "This says nothing about RENDERING: the run was -NullRHI,"
+              echo "and there is no GPU on this machine."
+            else
+              echo "It downloaded, extracted and the binary is there, but the"
+              echo "editor did not exit 0. Its own output is below; read it"
+              echo "before concluding the machine is at fault."
+            fi
+            echo ""
+            echo "== last 60 lines the editor printed =="
+            tail -60 /tmp/boot.stdout 2>/dev/null || echo "(none)"
+            echo ""
+            echo "== last 60 lines of the editor's log =="
+            tail -60 /tmp/boot.log 2>/dev/null || echo "(none)"
+          } > "$OUT"
+          echo "wrote $OUT"
+
+          if [ "$DO_COMMIT" != "true" ]; then
+            echo "delivered=skipped" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ ! -f Tools/push_with_merge.sh ]; then
+            echo "Tools/push_with_merge.sh is missing from the checkout."
+            echo "delivered=no" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          git config user.name  "tbs-runner"
+          git config user.email "noreply@github.com"
+          git add "$OUT"
+          git commit -m "prebuilt engine: measured on the public runner, run ${RUN_ID}"
+          if [ $? -ne 0 ]; then
+            echo "nothing to commit."
+            echo "delivered=no" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          H=$(git rev-parse --short HEAD)
+          python3 Tools/record_commit.py "$H" \
+            "Epic's prebuilt Linux engine on the public runner (\`${OUT}\`), run ${RUN_ID}: download rc=${D_RC} in ${D_SECS}s for ${D_MB}MB, unzip rc=${U_RC} in ${U_SECS}s to ${U_MB}MB, editor found=${F_FOUND}, boot rc=${B_RC} in ${B_SECS}s. Written by \`Runner\` \`prebuilt.yml\`, not by a person."
+          if [ $? -ne 0 ]; then
+            echo "record_commit failed -- not pushing an unrecorded commit."
+            echo "delivered=no" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          git add Team/CHANGELOG.md
+          git commit -m "changelog: record ${H}"
+          bash Tools/push_with_merge.sh "${BRANCH}"
+          if [ $? -ne 0 ]; then
+            echo "delivered=no" >> "$GITHUB_OUTPUT"
+            echo "THE REPORT DID NOT REACH THE REPOSITORY."
+            exit 1
+          fi
+          echo "delivered=yes" >> "$GITHUB_OUTPUT"
+
+      - name: Verdict
+        if: ${{ always() }}
+        run: |
+          set +e
+          if [ "${{ steps.secret.outputs.ok }}" != "yes" ]; then
+            echo "NOT MEASURED. A secret is missing; nothing ran."
+            exit 1
+          fi
+          if [ "${{ steps.dl.outputs.rc }}" != "0" ]; then
+            echo "download rc=${{ steps.dl.outputs.rc }} -- see the report."
+            exit 1
+          fi
+          if [ "${{ steps.unzip.outputs.rc }}" != "0" ]; then
+            echo "unzip rc=${{ steps.unzip.outputs.rc }} -- see the report."
+            exit 1
+          fi
+          if [ "${{ steps.find.outputs.found }}" != "yes" ]; then
+            echo "no UnrealEditor-Cmd in the extracted tree."
+            exit 1
+          fi
+          if [ "${{ steps.deliver.outputs.delivered }}" = "no" ]; then
+            echo "measured, but THE REPORT DID NOT REACH THE REPOSITORY."
+            exit 1
+          fi
+          if [ "${{ inputs.boot }}" = "true" ] \
+             && [ "${{ steps.boot.outputs.rc }}" != "0" ]; then
+            echo "engine unpacked, but the editor exited ${{ steps.boot.outputs.rc }}."
+            echo "That is a real result and it is in the report."
+            exit 1
+          fi
+          echo "prebuilt engine unpacked and started on a hosted runner"
