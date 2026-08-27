@@ -194,7 +194,18 @@ jobs:
           # workspace is bind-mounted INTO the container at the same absolute
           # path it has outside, so every later step runs against one copy of
           # the engine and writes its output straight back onto the host.
-          docker run -d --name tbsue \
+          #
+          # --user root, and run 33047625082 is why. The container came up,
+          # the mount arrived, the editor was found -- and then the editor
+          # died with "Failed to create Intermediate directory
+          # '/home/runner/work/Runner/Runner/work/Intermediate/'". That is
+          # the right absolute path, so the mount was fine; the image's own
+          # user (its home is /home/ue4) simply cannot WRITE into a workspace
+          # owned by the host's runner user. Reading it could, which is why
+          # the rc 75 mount test passed and hid this.
+          # The workspace is chowned back to the host user by a later step,
+          # so nothing the host runs afterwards meets a root-owned file.
+          docker run -d --name tbsue --user root \
             -v "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE" \
             -w "$GITHUB_WORKSPACE" \
             --entrypoint sleep "$IMG" infinity > /tmp/run.txt 2>&1
@@ -223,6 +234,24 @@ jobs:
             exit 0
           fi
           echo "the project file is visible inside the container."
+          # SEEING A FILE AND BEING ABLE TO WRITE BESIDE IT ARE DIFFERENT
+          # QUESTIONS, and run 33047625082 was decided by the second one
+          # while this step only ever asked the first. A build that cannot
+          # write and a build that fails to compile produce different rcs
+          # and the same shrug, so ask now, in one line, and put the answer
+          # in the report.
+          echo "uid inside container : $(docker exec tbsue id -u 2>&1 | head -1)"
+          docker exec tbsue sh -c "touch '$GITHUB_WORKSPACE/work/.tbs_write' && rm -f '$GITHUB_WORKSPACE/work/.tbs_write'" > /tmp/wr.txt 2>&1
+          if [ $? -eq 0 ]; then
+            echo "wr=yes" >> "$GITHUB_OUTPUT"
+            echo "write test into the bind mount : rc 0"
+          else
+            echo "wr=no" >> "$GITHUB_OUTPUT"
+            echo "CANNOT WRITE INTO THE BIND MOUNT. This is not a compile"
+            echo "error and not a missing engine; every later rc is downstream"
+            echo "of it. What it said:"
+            tail -3 /tmp/wr.txt
+          fi
           FREE=$(df -BG / | awk 'NR==2{gsub("G","",$4); print $4}')
           DMB=$(docker system df --format '{{.Type}} {{.Size}}' 2>/dev/null | tr '\n' ' ')
           echo "docker on disk : ${DMB:-<not reported>}"
@@ -435,6 +464,26 @@ jobs:
           echo "--- last 40 lines of its own log ---"
           tail -40 /tmp/boot.log 2>/dev/null
 
+      - name: Hand the workspace back to the runner user
+        if: ${{ always() }}
+        run: |
+          set +e
+          # The container runs as root so it can write into the bind mount,
+          # which means anything it created on the host is root-owned. Every
+          # step after this one runs as the runner user, and `git add` on a
+          # tree it cannot stat is a confusing way to lose a report. Hand it
+          # back inside the container, because the host user cannot chown
+          # what root made.
+          docker inspect tbsue > /dev/null 2>&1
+          if [ $? -ne 0 ]; then
+            echo "no container; nothing to hand back."
+            exit 0
+          fi
+          docker exec tbsue chown -R "$(id -u):$(id -g)" "$GITHUB_WORKSPACE" > /tmp/chown.txt 2>&1
+          echo "chown rc=$? -- and this is a cleanup, not a measurement:"
+          echo "a non-zero here does not invalidate any number above it."
+          tail -3 /tmp/chown.txt 2>/dev/null
+
       - name: Write the report and push it to the PRIVATE repo
         id: deliver
         if: ${{ always() && steps.secret.outputs.ok == 'yes' }}
@@ -450,6 +499,7 @@ jobs:
           P_SECS:  ${{ steps.pull.outputs.secs }}
           P_DF:    ${{ steps.pull.outputs.dockerdf }}
           P_FREE:  ${{ steps.pull.outputs.free }}
+          P_WR:    ${{ steps.pull.outputs.wr }}
           D_RC:    ${{ steps.dl.outputs.rc }}
           D_SECS:  ${{ steps.dl.outputs.secs }}
           D_MB:    ${{ steps.dl.outputs.mb }}
@@ -495,6 +545,7 @@ jobs:
             echo "pull seconds  : ${P_SECS:-<none>}"
             echo "docker on disk: ${P_DF:-<none>}"
             echo "free on /     : ${P_FREE:-<none>} GB"
+            echo "write into bind mount : ${P_WR:-<not tested>}"
             echo "  NOTHING IS COPIED OUT of the image on this route: the"
             echo "  workspace is bind-mounted in and the build runs inside,"
             echo "  so only ONE engine tree exists on disk. Copying it out"
@@ -530,6 +581,13 @@ jobs:
             echo "binary on disk : ${C_SO:-<none>}"
             echo "  rc 90 means the .uproject was missing, rc 91 means the"
             echo "  engine tree had no Build.sh. Neither is a compile error."
+            echo "  ANY OTHER non-zero rc is the build tool's own, and the"
+            echo "  log below is the only thing that says which. Run"
+            echo "  33047625082 reported rc 6 in 1 second with no log in this"
+            echo "  file at all, so nobody could tell a compile error from a"
+            echo "  permission error without opening Actions."
+            echo "--- last 40 lines of the build log ---"
+            tail -40 /tmp/build.log 2>/dev/null || echo "(none)"
             echo ""
             echo "== boot, -NullRHI, running Tools/probe_boot.py =="
             echo "rc         : ${B_RC:-<step did not run>}"
@@ -542,27 +600,46 @@ jobs:
               echo "so any boot failure below is downstream of that and says"
               echo "nothing about the engine or the machine."
             fi
-            if [ "${D_RC}" != "0" ]; then
+            # BRANCH ON THE ROUTE FIRST. Run 33047625082 pulled an image,
+            # found the editor, built and booted -- and this section told its
+            # reader "NOT MEASURED past the download", because D_RC is empty
+            # on the image route and an empty string is not "0". A verdict
+            # that describes a step which never ran is worse than no verdict.
+            if [ "${SRC}" = "image" ] && [ "${P_WR}" = "no" ]; then
+              echo "THE CONTAINER CANNOT WRITE INTO THE BIND-MOUNTED"
+              echo "WORKSPACE. Every rc below this line is downstream of that"
+              echo "and none of them is a statement about the engine, the"
+              echo "image or the machine."
+            elif [ "${SRC}" = "image" ] && [ "${P_RC}" != "0" ]; then
+              echo "NOT MEASURED past the pull. rc ${P_RC:-<none>}."
+              echo "rc 70 is docker login refused -- a credential, not a"
+              echo "size. rc 71 is an image with no UnrealEditor-Cmd in it."
+              echo "rc 73/74/75 are the container and the mount. None of"
+              echo "these is 'the engine does not run'."
+            elif [ "${SRC}" != "image" ] && [ "${D_RC}" != "0" ]; then
               echo "NOT MEASURED past the download. rc ${D_RC:-<none>}, and"
               echo "curl said: ${D_MSG:-<nothing was captured>}"
               echo "rc 22 is an expired signature, rc 23 is a write error,"
               echo "and neither is the same answer as 'the engine does not"
               echo "fit' or 'the engine does not run'."
-            elif [ "${U_RC}" != "0" ]; then
+            elif [ "${SRC}" != "image" ] && [ "${U_RC}" != "0" ]; then
               echo "The archive did not extract. Check the free-space numbers"
               echo "above before blaming the archive."
             elif [ "${F_FOUND}" != "yes" ]; then
-              echo "Extracted, but there is NO UnrealEditor-Cmd in the tree."
-              echo "Whatever this zip is, it is not a runnable editor."
+              echo "The engine arrived, and there is NO UnrealEditor-Cmd in"
+              echo "it. Whatever this ${SRC} is, it is not a runnable editor."
             elif [ "${B_RC}" = "0" ]; then
               echo "THE EDITOR STARTS ON A GITHUB RUNNER. First time in this"
               echo "project that Unreal has run anywhere but the laptop."
               echo "This says nothing about RENDERING: the run was -NullRHI,"
               echo "and there is no GPU on this machine."
             else
-              echo "It downloaded, extracted and the binary is there, but the"
+              echo "The engine is here and the binary is there, but the"
               echo "editor did not exit 0. Its own output is below; read it"
-              echo "before concluding the machine is at fault."
+              echo "before concluding the machine is at fault -- and read the"
+              echo "build section above it first, because a module that did"
+              echo "not compile makes the editor exit for a reason that has"
+              echo "nothing to do with the runner."
             fi
             echo ""
             echo "== last 60 lines the editor printed =="
