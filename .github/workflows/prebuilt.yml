@@ -857,12 +857,30 @@ jobs:
               exit 1
             fi
           fi
-          if [ "${{ steps.find.outputs.found }}" != "yes" ]; then
-            echo "no UnrealEditor-Cmd in the extracted tree."
+          # THE SAME EMPTY-OUTPUT TRAP, THIRD INSTANCE. The `find` step runs
+          # ONLY on the zip route, so on the image route its output is the
+          # empty string and [ "" != "yes" ] is true. Run 33090067823 built
+          # the module, booted the editor and collected FOUR ##TBS## lines,
+          # and this line still called it "no UnrealEditor-Cmd in the
+          # extracted tree" -- there is no extracted tree on that route at
+          # all. The report step at F_FOUND already had the both-routes
+          # expression; this is that same expression, and the two now agree.
+          if [ "${{ steps.find.outputs.found || (steps.pull.outputs.editor && 'yes') }}" != "yes" ]; then
+            echo "no UnrealEditor-Cmd on either route."
             exit 1
           fi
           if [ "${{ steps.deliver.outputs.delivered }}" = "no" ]; then
             echo "measured, but THE REPORT DID NOT REACH THE REPOSITORY."
+            exit 1
+          fi
+          # A SKIPPED BOOT AND A BOOT THAT EXITED NON-ZERO ARE DIFFERENT
+          # ANSWERS, and an empty rc is not an exit code. Without the
+          # emptiness test this prints "the editor exited ." -- which reads
+          # as a failed engine and is really a step that never ran.
+          if [ "${{ inputs.boot }}" = "true" ] \
+             && [ -z "${{ steps.boot.outputs.rc }}" ]; then
+            echo "boot was asked for and the step did not run. NOT MEASURED;"
+            echo "that is not the same answer as an editor that failed."
             exit 1
           fi
           if [ "${{ inputs.boot }}" = "true" ] \
