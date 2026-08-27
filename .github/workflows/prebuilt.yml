@@ -33,6 +33,15 @@ on:
         description: 'after unpacking, try to start the editor on this project'
         type: boolean
         default: true
+      source:
+        description: 'where the engine comes from'
+        type: choice
+        options: [image, zip]
+        default: image
+      build:
+        description: 'compile the TehranBlindSpot module for Linux first'
+        type: boolean
+        default: true
       commit:
         description: 'push the report to the private repo'
         type: boolean
@@ -50,6 +59,7 @@ jobs:
         env:
           TOK: ${{ secrets.TBS_PRIVATE_TOKEN }}
           ZIP: ${{ secrets.TBS_ENGINE_ZIP_URL }}
+          SRC: ${{ inputs.source }}
         run: |
           set +e
           OK=yes
@@ -57,14 +67,21 @@ jobs:
             echo "TBS_PRIVATE_TOKEN is NOT set."
             OK=no
           fi
-          if [ -z "$ZIP" ]; then
-            echo "TBS_ENGINE_ZIP_URL is NOT set. Add it as a repository"
-            echo "secret: the presigned download URL for Epic's"
-            echo "Linux_Unreal_Engine_5.8.2.zip. It is a credential and it"
-            echo "expires, so it does not belong in a workflow file or a"
-            echo "dispatch input on a public repository."
+          # The zip URL is only needed when the zip IS the source. Since
+          # run 33046053174 measured ghcr.io serving
+          # epicgames/unreal-engine:dev-slim-5.8.2 to a token that does not
+          # expire, the default source is the image and this secret is
+          # optional. Demanding it unconditionally would block the very run
+          # that no longer needs it.
+          if [ "${SRC}" = "zip" ] && [ -z "$ZIP" ]; then
+            echo "source=zip was asked for but TBS_ENGINE_ZIP_URL is NOT set."
+            echo "It is the presigned download URL for Epic's"
+            echo "Linux_Unreal_Engine_5.8.2.zip -- a credential that expires,"
+            echo "so it does not belong in a workflow file or a dispatch"
+            echo "input on a public repository. Use source=image instead."
             OK=no
           fi
+          echo "engine source : ${SRC}"
           echo "ok=$OK" >> "$GITHUB_OUTPUT"
           [ "$OK" = "yes" ] && echo "both secrets present"
 
@@ -115,9 +132,112 @@ jobs:
           echo "--- ownership, for the record ---"
           ls -ld /mnt /mnt/dl /home/runner /home/runner/ue 2>&1
 
+      - name: Pull the engine image from ghcr.io
+        id: pull
+        if: ${{ steps.secret.outputs.ok == 'yes' && inputs.source == 'image' }}
+        env:
+          TOK: ${{ secrets.TBS_PRIVATE_TOKEN }}
+          IMG: ghcr.io/epicgames/unreal-engine:dev-slim-5.8.2
+        run: |
+          set +e
+          # WHY THIS REPLACES THE ZIP. Run 33046053174 measured ghcr.io
+          # answering 200 for epicgames/unreal-engine and listing 89 tags
+          # including dev-slim-5.8.2, whose manifest is 22888 MB compressed
+          # against the presigned zip's 37973 MB. A registry credential does
+          # not expire in an hour, which is the whole reason the zip route
+          # needed a hand-minted link before every single run.
+          #
+          # TBS_PRIVATE_TOKEN carries write:packages, so the same secret this
+          # workflow already uses can pull it. No new secret is introduced.
+          BEGAN=$(date +%s)
+          echo "$TOK" | docker login ghcr.io -u Mohammadlali --password-stdin > /tmp/login.txt 2>&1
+          if [ $? -ne 0 ]; then
+            echo "rc=70" >> "$GITHUB_OUTPUT"
+            echo "docker login to ghcr.io FAILED. What it said:"
+            sed -e 's/[A-Za-z0-9_-]\{20,\}/<redacted>/g' /tmp/login.txt | head -5
+            exit 0
+          fi
+          echo "logged in to ghcr.io."
+          docker pull "$IMG" > /tmp/pull.txt 2>&1
+          RC=$?
+          SECS=$(( $(date +%s) - BEGAN ))
+          echo "pull rc=$RC in ${SECS}s"
+          if [ $RC -ne 0 ]; then
+            echo "rc=$RC" >> "$GITHUB_OUTPUT"
+            echo "the pull failed. Its own last lines:"
+            tail -5 /tmp/pull.txt
+            exit 0
+          fi
+          docker image inspect "$IMG" --format 'image size on disk : {{.Size}} bytes' 2>/dev/null
+          # DO NOT GUESS WHERE THE ENGINE LIVES INSIDE THE IMAGE. Ask it.
+          # A path typed from memory that happens to be wrong looks exactly
+          # like an image with no editor in it.
+          CMD=$(docker run --rm --entrypoint sh "$IMG" -c 'find / -maxdepth 8 -type f -name UnrealEditor-Cmd 2>/dev/null | head -1')
+          if [ -z "$CMD" ]; then
+            echo "rc=71" >> "$GITHUB_OUTPUT"
+            echo "NO UnrealEditor-Cmd ANYWHERE IN THE IMAGE."
+            echo "This is the real answer to whether dev-slim carries an"
+            echo "editor, and it is no. Re-run with the dev-5.8.2 tag."
+            echo "--- top-level directories in the image, for the record ---"
+            docker run --rm --entrypoint sh "$IMG" -c 'ls -1 /' 2>/dev/null | head -20
+            exit 0
+          fi
+          echo "editor inside the image : $CMD"
+          ROOT=$(dirname "$(dirname "$(dirname "$(dirname "$CMD")")")")
+          echo "engine root inside      : $ROOT"
+          # NOTHING IS COPIED OUT, AND THAT IS THE POINT.
+          # `docker cp` of the engine would put a SECOND full tree on the
+          # same disk the extracted image already occupies -- both alive at
+          # once, on the one 116 GB pool run 33041967920 proved /mnt shares
+          # with /. The zip route already came within 6 GB of the wall doing
+          # exactly that with the zip and its unpacked tree. Instead the
+          # workspace is bind-mounted INTO the container at the same absolute
+          # path it has outside, so every later step runs against one copy of
+          # the engine and writes its output straight back onto the host.
+          docker run -d --name tbsue \
+            -v "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE" \
+            -w "$GITHUB_WORKSPACE" \
+            --entrypoint sleep "$IMG" infinity > /tmp/run.txt 2>&1
+          if [ $? -ne 0 ]; then
+            echo "rc=73" >> "$GITHUB_OUTPUT"
+            echo "the container would not start:"
+            tail -5 /tmp/run.txt
+            exit 0
+          fi
+          # Read it back: a container that exited immediately and one that is
+          # running are the same `docker run` exit code.
+          ST=$(docker inspect -f '{{.State.Status}}' tbsue 2>/dev/null)
+          echo "container status : ${ST:-<none>}"
+          if [ "$ST" != "running" ]; then
+            echo "rc=74" >> "$GITHUB_OUTPUT"
+            echo "the container is not running. Its last output:"
+            docker logs tbsue 2>&1 | tail -5
+            exit 0
+          fi
+          # Prove the mount actually arrived, rather than assuming -v worked.
+          docker exec tbsue ls -la "$GITHUB_WORKSPACE/work/TehranBlindSpot.uproject" > /tmp/mnt.txt 2>&1
+          if [ $? -ne 0 ]; then
+            echo "rc=75" >> "$GITHUB_OUTPUT"
+            echo "the workspace is NOT visible inside the container:"
+            tail -3 /tmp/mnt.txt
+            exit 0
+          fi
+          echo "the project file is visible inside the container."
+          FREE=$(df -BG / | awk 'NR==2{gsub("G","",$4); print $4}')
+          DMB=$(docker system df --format '{{.Type}} {{.Size}}' 2>/dev/null | tr '\n' ' ')
+          echo "docker on disk : ${DMB:-<not reported>}"
+          echo "free on /      : ${FREE} GB"
+          echo "rc=0"            >> "$GITHUB_OUTPUT"
+          echo "secs=$SECS"      >> "$GITHUB_OUTPUT"
+          echo "editor=$CMD"     >> "$GITHUB_OUTPUT"
+          echo "engine=$ROOT"    >> "$GITHUB_OUTPUT"
+          echo "exec=docker exec tbsue" >> "$GITHUB_OUTPUT"
+          echo "free=${FREE}"    >> "$GITHUB_OUTPUT"
+          echo "dockerdf=${DMB}" >> "$GITHUB_OUTPUT"
+
       - name: Download the prebuilt engine
         id: dl
-        if: steps.secret.outputs.ok == 'yes'
+        if: ${{ steps.secret.outputs.ok == 'yes' && inputs.source == 'zip' }}
         env:
           ZIP: ${{ secrets.TBS_ENGINE_ZIP_URL }}
         run: |
@@ -160,7 +280,7 @@ jobs:
 
       - name: Unzip it, then delete the zip
         id: unzip
-        if: ${{ steps.secret.outputs.ok == 'yes' && steps.dl.outputs.rc == '0' }}
+        if: ${{ steps.secret.outputs.ok == 'yes' && steps.dl.outputs.rc == '0' && inputs.source == 'zip' }}
         run: |
           set +e
           BEGAN=$(date +%s)
@@ -188,7 +308,7 @@ jobs:
 
       - name: Find the editor
         id: find
-        if: ${{ steps.secret.outputs.ok == 'yes' && steps.unzip.outputs.rc == '0' }}
+        if: ${{ steps.secret.outputs.ok == 'yes' && steps.unzip.outputs.rc == '0' && inputs.source == 'zip' }}
         run: |
           set +e
           # Do not assume the zip has no wrapping directory -- look for the
@@ -211,21 +331,93 @@ jobs:
           echo "engine=$ENGDIR" >> "$GITHUB_OUTPUT"
           echo "engine root : $ENGDIR"
 
+      - name: Build the TehranBlindSpot module for Linux
+        id: build
+        if: ${{ steps.secret.outputs.ok == 'yes' && (steps.find.outputs.found == 'yes' || steps.pull.outputs.rc == '0') && inputs.build }}
+        env:
+          ENG:  ${{ steps.find.outputs.engine || steps.pull.outputs.engine }}
+          PFX:  ${{ steps.pull.outputs.exec }}
+        run: |
+          set +e
+          # WHY THIS STEP EXISTS. Run 33041967920 got the editor to boot and
+          # it exited 1 saying, in its own words: "The game module
+          # 'TehranBlindSpot' could not be found. Please ensure that this
+          # module exists and that it is compiled." The module has only ever
+          # been compiled on the owner's Windows laptop and binaries are not
+          # in git, so on Linux there is nothing to load. This compiles it.
+          #
+          # It is OUR module against an ALREADY-BUILT engine -- minutes, not
+          # the hours an engine compile would cost. Nothing here builds the
+          # engine.
+          PROJ="$GITHUB_WORKSPACE/work/TehranBlindSpot.uproject"
+          BUILD="$ENG/Engine/Build/BatchFiles/Linux/Build.sh"
+          echo "engine root : $ENG"
+          echo "project     : $PROJ"
+          # Prove each input exists BEFORE spending the build, because "the
+          # script was not there" and "the compile failed" are different
+          # answers and a bare non-zero rc cannot tell them apart.
+          # $PFX is empty on the zip route and "docker exec tbsue" on the
+          # image route, so one line of shell serves both. Without it these
+          # tests would ask the HOST about a path that only exists inside the
+          # container and report rc 90/91 -- a missing file -- for an engine
+          # that is sitting right there.
+          if ! $PFX test -f "$PROJ"; then
+            echo "rc=90" >> "$GITHUB_OUTPUT"
+            echo "THE PROJECT FILE IS NOT THERE. Nothing was compiled."
+            ls -la "$GITHUB_WORKSPACE/work" | head -20
+            exit 0
+          fi
+          if ! $PFX test -f "$BUILD"; then
+            echo "rc=91" >> "$GITHUB_OUTPUT"
+            echo "NO Build.sh AT $BUILD -- this engine tree has no build tool."
+            echo "--- what IS in BatchFiles, for the record ---"
+            ls -1 "$ENG/Engine/Build/BatchFiles" 2>/dev/null | head -20
+            ls -1 "$ENG/Engine/Build/BatchFiles/Linux" 2>/dev/null | head -20
+            exit 0
+          fi
+          $PFX chmod +x "$BUILD" 2>/dev/null
+          BEGAN=$(date +%s)
+          # TehranBlindSpotEditor, not TehranBlindSpot: the Editor target is
+          # the one UnrealEditor-Cmd loads, and it is what every probe needs.
+          timeout 3600 $PFX "$BUILD" TehranBlindSpotEditor Linux Development \
+            -project="$PROJ" -waitmutex > /tmp/build.log 2>&1
+          RC=$?
+          SECS=$(( $(date +%s) - BEGAN ))
+          echo "rc=$RC"     >> "$GITHUB_OUTPUT"
+          echo "secs=$SECS" >> "$GITHUB_OUTPUT"
+          echo "build rc=$RC in ${SECS}s"
+          # Read the RESULT back rather than trusting the exit code: a build
+          # that silently produced nothing and one that worked have the same
+          # rc often enough to be worth two seconds here.
+          SO=$(find "$GITHUB_WORKSPACE/work/Binaries/Linux" -name '*TehranBlindSpot*' \
+                 -type f 2>/dev/null | head -5)
+          if [ -n "$SO" ]; then
+            echo "so=yes" >> "$GITHUB_OUTPUT"
+            echo "--- binaries produced ---"
+            echo "$SO" | while read -r f; do ls -la "$f"; done
+          else
+            echo "so=no" >> "$GITHUB_OUTPUT"
+            echo "NO TehranBlindSpot BINARY under work/Binaries/Linux."
+          fi
+          echo "--- last 40 lines of the build log ---"
+          tail -40 /tmp/build.log 2>/dev/null
+
       - name: Start it on this project
         id: boot
-        if: ${{ steps.secret.outputs.ok == 'yes' && steps.find.outputs.found == 'yes' && inputs.boot }}
+        if: ${{ steps.secret.outputs.ok == 'yes' && (steps.find.outputs.found == 'yes' || steps.pull.outputs.rc == '0') && inputs.boot }}
         env:
-          CMD: ${{ steps.find.outputs.editor }}
+          CMD:  ${{ steps.find.outputs.editor || steps.pull.outputs.editor }}
+          PFX:  ${{ steps.pull.outputs.exec }}
         run: |
           set +e
           PROJ="$GITHUB_WORKSPACE/work/TehranBlindSpot.uproject"
-          ls -la "$PROJ"
+          $PFX ls -la "$PROJ"
           BEGAN=$(date +%s)
           # -NullRHI because there is no GPU here; this asks only whether the
           # editor STARTS and runs the project's own data-only probe, not
           # whether anything renders. Those are different questions and this
           # step answers the first one only.
-          timeout 1800 "$CMD" "$PROJ" \
+          timeout 1800 $PFX "$CMD" "$PROJ" \
             -ExecutePythonScript="$GITHUB_WORKSPACE/work/Tools/probe_boot.py" \
             -unattended -nopause -nosplash -NullRHI -stdout \
             -abslog=/tmp/boot.log > /tmp/boot.stdout 2>&1
@@ -253,6 +445,11 @@ jobs:
           FREEM:   ${{ steps.room.outputs.free_mnt }}
           W_DL:    ${{ steps.room.outputs.writable_dl }}
           W_UE:    ${{ steps.room.outputs.writable_ue }}
+          SRC:     ${{ inputs.source }}
+          P_RC:    ${{ steps.pull.outputs.rc }}
+          P_SECS:  ${{ steps.pull.outputs.secs }}
+          P_DF:    ${{ steps.pull.outputs.dockerdf }}
+          P_FREE:  ${{ steps.pull.outputs.free }}
           D_RC:    ${{ steps.dl.outputs.rc }}
           D_SECS:  ${{ steps.dl.outputs.secs }}
           D_MB:    ${{ steps.dl.outputs.mb }}
@@ -263,8 +460,11 @@ jobs:
           U_TIGHT: ${{ steps.unzip.outputs.tight }}
           U_FREE:  ${{ steps.unzip.outputs.free }}
           U_MNT:   ${{ steps.unzip.outputs.mntfree }}
-          F_FOUND: ${{ steps.find.outputs.found }}
-          F_CMD:   ${{ steps.find.outputs.editor }}
+          F_FOUND: ${{ steps.find.outputs.found || (steps.pull.outputs.editor && 'yes') }}
+          F_CMD:   ${{ steps.find.outputs.editor || steps.pull.outputs.editor }}
+          C_RC:    ${{ steps.build.outputs.rc }}
+          C_SECS:  ${{ steps.build.outputs.secs }}
+          C_SO:    ${{ steps.build.outputs.so }}
           B_RC:    ${{ steps.boot.outputs.rc }}
           B_SECS:  ${{ steps.boot.outputs.secs }}
           B_TBS:   ${{ steps.boot.outputs.tbs }}
@@ -288,7 +488,25 @@ jobs:
             echo "write test, /mnt/dl        : rc ${W_DL:-<step did not run>}"
             echo "write test, /home/runner/ue: rc ${W_UE:-<step did not run>}"
             echo ""
-            echo "== download =="
+            echo "engine source : ${SRC:-<none>}"
+            echo ""
+            echo "== pull, ghcr.io/epicgames/unreal-engine:dev-slim-5.8.2 =="
+            echo "rc            : ${P_RC:-<step did not run>}"
+            echo "pull seconds  : ${P_SECS:-<none>}"
+            echo "docker on disk: ${P_DF:-<none>}"
+            echo "free on /     : ${P_FREE:-<none>} GB"
+            echo "  NOTHING IS COPIED OUT of the image on this route: the"
+            echo "  workspace is bind-mounted in and the build runs inside,"
+            echo "  so only ONE engine tree exists on disk. Copying it out"
+            echo "  would put a second one beside it, and the zip route"
+            echo "  already came within 6 GB of the wall doing that."
+            echo "  rc 70 = docker login refused. rc 71 = NO UnrealEditor-Cmd"
+            echo "  anywhere in the image, the real answer to whether"
+            echo "  dev-slim carries an editor. rc 73/74 = the container did"
+            echo "  not start or did not stay up. rc 75 = the bind mount did"
+            echo "  not arrive."
+            echo ""
+            echo "== download (zip source only) =="
             echo "rc         : ${D_RC:-<step did not run>}"
             echo "seconds    : ${D_SECS:-<none>}"
             echo "MB         : ${D_MB:-<none>}"
@@ -306,12 +524,24 @@ jobs:
             echo "found      : ${F_FOUND:-<step did not run>}"
             echo "path       : ${F_CMD:-<none>}"
             echo ""
+            echo "== build, TehranBlindSpotEditor Linux Development =="
+            echo "rc         : ${C_RC:-<step did not run>}"
+            echo "seconds    : ${C_SECS:-<none>}"
+            echo "binary on disk : ${C_SO:-<none>}"
+            echo "  rc 90 means the .uproject was missing, rc 91 means the"
+            echo "  engine tree had no Build.sh. Neither is a compile error."
+            echo ""
             echo "== boot, -NullRHI, running Tools/probe_boot.py =="
             echo "rc         : ${B_RC:-<step did not run>}"
             echo "seconds    : ${B_SECS:-<none>}"
             echo "##TBS## lines : ${B_TBS:-<none>}"
             echo ""
             echo "== VERDICT =="
+            if [ "${C_RC:-x}" != "0" ] && [ "${C_RC:-x}" != "x" ]; then
+              echo "READ THE BUILD SECTION FIRST: the module did not compile,"
+              echo "so any boot failure below is downstream of that and says"
+              echo "nothing about the engine or the machine."
+            fi
             if [ "${D_RC}" != "0" ]; then
               echo "NOT MEASURED past the download. rc ${D_RC:-<none>}, and"
               echo "curl said: ${D_MSG:-<nothing was captured>}"
