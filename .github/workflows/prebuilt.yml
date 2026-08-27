@@ -42,6 +42,10 @@ on:
         description: 'compile the TehranBlindSpot module for Linux first'
         type: boolean
         default: true
+      render:
+        description: 'ask whether this container can render, then render Valiasr offscreen'
+        type: boolean
+        default: true
       commit:
         description: 'push the report to the private repo'
         type: boolean
@@ -93,6 +97,13 @@ jobs:
           token: ${{ secrets.TBS_PRIVATE_TOKEN }}
           fetch-depth: 0
           path: work
+          # WITHOUT THIS, Content/ ARRIVES AS 130-BYTE POINTERS. Every .umap
+          # and .uasset is Git LFS, so `district_01_valiasr.umap` -- the level
+          # rung 4 has to render -- is a text stub and load_level fails for a
+          # reason that looks nothing like the real one. Measured 2026-08-27:
+          # the whole LFS payload is 179 objects and 16.3 MB, the map itself
+          # 117 KB, so this costs essentially nothing.
+          lfs: true
 
       - name: Make room
         id: room
@@ -567,6 +578,113 @@ jobs:
           echo "--- last 40 lines of its own log ---"
           tail -40 "$LOG" 2>/dev/null
 
+      - name: Can this container render at all
+        id: vk
+        if: ${{ steps.secret.outputs.ok == 'yes' && steps.pull.outputs.rc == '0' && inputs.render }}
+        env:
+          PFX: ${{ steps.pull.outputs.exec }}
+        run: |
+          set +e
+          # THE CHEAP DECISIVE QUESTION, ASKED BEFORE ANYTHING TRIES TO RENDER.
+          # UE5 on Linux renders through Vulkan. There is no GPU on this
+          # machine, so the target here is LAVAPIPE -- Mesa's SOFTWARE Vulkan
+          # driver. That is a legitimate goal for this project: the scenes are
+          # axis-aligned boxes with FULLY BAKED lighting, no Nanite, no Lumen.
+          #
+          # READ THIS BEFORE BELIEVING A PASS. A software device enumerating
+          # is NOT a GPU rendering, and this project already has a scar file
+          # for exactly that confusion -- Reports/cloud_host/
+          # kaggle_vulkan_2026-08-26.CORRECTION.md exists because a digest
+          # reported "supplied" when only llvmpipe was present. So this step
+          # reports the DEVICE TYPE and never collapses it into a yes.
+          LOADER=$($PFX sh -c 'ls /usr/lib/x86_64-linux-gnu/libvulkan.so.1 2>/dev/null | head -1')
+          echo "vulkan loader : ${LOADER:-<none>}"
+          if [ -z "$LOADER" ]; then
+            echo "rc=80" >> "$GITHUB_OUTPUT"
+            echo "no Vulkan loader in the image. That is a MISSING LIBRARY,"
+            echo "not a machine that cannot render: libvulkan1 and mesa's"
+            echo "lavapipe are apt packages. rc 80."
+            exit 0
+          fi
+          ICDS=$($PFX sh -c 'ls -1 /usr/share/vulkan/icd.d/ 2>/dev/null')
+          echo "icd files     : ${ICDS:-<none>}"
+          if [ -z "$ICDS" ]; then
+            echo "rc=81" >> "$GITHUB_OUTPUT"
+            echo "a loader with NO ICD. The loader is not a driver; it finds"
+            echo "one. rc 81."
+            exit 0
+          fi
+          $PFX sh -c 'command -v vulkaninfo >/dev/null && vulkaninfo --summary' \
+            > /tmp/vk.txt 2>&1
+          VKRC=$?
+          echo "--- vulkaninfo --summary ---"
+          head -40 /tmp/vk.txt
+          # deviceType tells software from hardware and nothing else does.
+          CPU_DEV=$(grep -c 'PHYSICAL_DEVICE_TYPE_CPU' /tmp/vk.txt 2>/dev/null)
+          GPU_DEV=$(grep -cE 'PHYSICAL_DEVICE_TYPE_(DISCRETE|INTEGRATED)_GPU' /tmp/vk.txt 2>/dev/null)
+          echo "cpu devices=$CPU_DEV  gpu devices=$GPU_DEV  vulkaninfo rc=$VKRC"
+          echo "cpu_devices=$CPU_DEV" >> "$GITHUB_OUTPUT"
+          echo "gpu_devices=$GPU_DEV" >> "$GITHUB_OUTPUT"
+          if [ "${CPU_DEV:-0}" = "0" ] && [ "${GPU_DEV:-0}" = "0" ]; then
+            echo "rc=82" >> "$GITHUB_OUTPUT"
+            echo "ICDs are present and NOTHING enumerated. rc 82."
+            exit 0
+          fi
+          echo "rc=0" >> "$GITHUB_OUTPUT"
+
+      - name: Render Valiasr offscreen
+        id: render
+        if: ${{ steps.secret.outputs.ok == 'yes' && steps.vk.outputs.rc == '0' && inputs.render }}
+        env:
+          CMD: ${{ steps.find.outputs.editor || steps.pull.outputs.editor }}
+          PFX: ${{ steps.pull.outputs.exec }}
+        run: |
+          set +e
+          PROJ="$GITHUB_WORKSPACE/work/TehranBlindSpot.uproject"
+          LOG="$GITHUB_WORKSPACE/render.log"
+          rm -f "$LOG" /tmp/render.stdout /tmp/render.digests
+          # NO -NullRHI. That flag is the whole difference between the boot
+          # step above and this one: it means no RHI at all, so nothing can
+          # render. The flags here are the ones Tools/ue.py already uses for
+          # its own render path, copied rather than invented.
+          # A TIMESTAMP MARKER, NOT THE .uproject. `-newer $PROJ` would have
+          # counted the 174 LFS REFERENCE PNGs as frames this run produced:
+          # with lfs:true they materialise at checkout, which is newer than
+          # nothing and older than everything. A marker made HERE cannot.
+          touch /tmp/render.mark
+          BEGAN=$(date +%s)
+          timeout 2400 $PFX "$CMD" "$PROJ" \
+            -ExecutePythonScript="$GITHUB_WORKSPACE/work/Tools/probe_district.py" \
+            -RenderOffScreen -ResX=1280 -ResY=720 \
+            -unattended -nopause -nosplash -stdout \
+            -abslog="$LOG" > /tmp/render.stdout 2>&1
+          RC=$?
+          SECS=$(( $(date +%s) - BEGAN ))
+          echo "rc=$RC"     >> "$GITHUB_OUTPUT"
+          echo "secs=$SECS" >> "$GITHUB_OUTPUT"
+          echo "render rc=$RC in ${SECS}s"
+          : > /tmp/render.digests
+          for F in "$LOG" /tmp/render.stdout; do
+            [ -f "$F" ] && grep -hE '##TBS##[[:space:]]*\{' "$F" >> /tmp/render.digests 2>/dev/null
+          done
+          sed -i 's/^.*\(##TBS##\)/\1/' /tmp/render.digests
+          sort -u /tmp/render.digests -o /tmp/render.digests
+          TBS=$(wc -l < /tmp/render.digests | tr -d " ")
+          echo "tbs=$TBS" >> "$GITHUB_OUTPUT"
+          echo "##TBS## lines produced : $TBS"
+          # A PNG ON DISK IS THE ONLY THING THAT MEANS A FRAME EXISTS. A probe
+          # reporting pass and a file being written are different claims, and
+          # this project has a scar for trusting the first.
+          SHOTS=$(find "$GITHUB_WORKSPACE/work/Reports" -name '*.png' -newer /tmp/render.mark 2>/dev/null | wc -l | tr -d " ")
+          echo "pngs=$SHOTS" >> "$GITHUB_OUTPUT"
+          echo "PNG files written : $SHOTS"
+          find "$GITHUB_WORKSPACE/work/Reports" -name '*.png' -newer /tmp/render.mark \
+            -printf '  %10s  %p\n' 2>/dev/null | head -20
+          echo "--- the digest lines themselves ---"
+          cat /tmp/render.digests
+          echo "--- last 40 lines the editor printed ---"
+          tail -40 /tmp/render.stdout 2>/dev/null
+
       - name: Hand the workspace back to the runner user
         if: ${{ always() }}
         run: |
@@ -619,6 +737,13 @@ jobs:
           B_TBS:   ${{ steps.boot.outputs.tbs }}
           B_LOGSEEN: ${{ steps.boot.outputs.logseen }}
           B_OUTSEEN: ${{ steps.boot.outputs.outseen }}
+          V_RC:    ${{ steps.vk.outputs.rc }}
+          V_CPU:   ${{ steps.vk.outputs.cpu_devices }}
+          V_GPU:   ${{ steps.vk.outputs.gpu_devices }}
+          R_RC:    ${{ steps.render.outputs.rc }}
+          R_SECS:  ${{ steps.render.outputs.secs }}
+          R_TBS:   ${{ steps.render.outputs.tbs }}
+          R_PNGS:  ${{ steps.render.outputs.pngs }}
           DO_COMMIT: ${{ inputs.commit }}
           BRANCH:  ${{ vars.TBS_BRANCH || 'claude/gateway-auth-fix-nr7k0b' }}
         run: |
@@ -719,6 +844,30 @@ jobs:
             echo "--- every ##TBS## line the boot produced ---"
             cat /tmp/boot.digests 2>/dev/null || echo "(none)"
             echo ""
+            echo "== can this container render at all =="
+            echo "vulkan step rc     : ${V_RC:-<step did not run>}"
+            echo "software devices   : ${V_CPU:-<none>}"
+            echo "hardware GPU dev   : ${V_GPU:-<none>}"
+            echo "  rc 80 = no Vulkan loader in the image, which is a MISSING"
+            echo "  LIBRARY and not a machine that cannot render. rc 81 = a"
+            echo "  loader with no ICD. rc 82 = ICDs present, nothing"
+            echo "  enumerated. A SOFTWARE device is the expected answer here:"
+            echo "  there is no GPU on this machine, and lavapipe rendering is"
+            echo "  NOT a claim that a GPU rendered. See"
+            echo "  Reports/cloud_host/kaggle_vulkan_2026-08-26.CORRECTION.md,"
+            echo "  which exists because a digest once collapsed that."
+            echo ""
+            echo "== render, -RenderOffScreen, Tools/probe_district.py =="
+            echo "rc            : ${R_RC:-<step did not run>}"
+            echo "seconds       : ${R_SECS:-<none>}"
+            echo "##TBS## lines : ${R_TBS:-<none>}"
+            echo "PNG files     : ${R_PNGS:-<none>}"
+            echo "  A PNG ON DISK is the only thing that means a frame exists."
+            echo "  A probe reporting pass and a file being written are"
+            echo "  different claims."
+            echo "--- every ##TBS## line the render produced ---"
+            cat /tmp/render.digests 2>/dev/null || echo "(none)"
+            echo ""
             echo "== VERDICT =="
             if [ "${C_RC:-x}" != "0" ] && [ "${C_RC:-x}" != "x" ]; then
               echo "READ THE BUILD SECTION FIRST: the module did not compile,"
@@ -801,6 +950,15 @@ jobs:
           git config user.name  "tbs-runner"
           git config user.email "noreply@github.com"
           git add "$OUT"
+          # THE FRAMES THEMSELVES. Without these the render is a number in a
+          # report and the cloud side still cannot see anything -- and seeing
+          # is the entire point of rung 4. Added only if any exist, so a run
+          # that rendered nothing still delivers the report saying so.
+          # Reports/district is where probe_district.py puts its shots --
+          # OUT_DIR at Tools/probe_district.py:35, read rather than assumed.
+          if [ -d Reports/district ] && [ -n "$(ls -A Reports/district 2>/dev/null)" ]; then
+            git add -f Reports/district
+          fi
           git commit -m "prebuilt engine: measured on the public runner, run ${RUN_ID}"
           if [ $? -ne 0 ]; then
             echo "nothing to commit."
