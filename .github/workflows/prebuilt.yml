@@ -85,11 +85,35 @@ jobs:
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
                       /usr/local/share/boost /usr/local/.ghcup \
                       /usr/share/swift /opt/hostedtoolcache 2>/dev/null
+          # TWO filesystems, and only one of them has ever been measured.
+          # / was 116 GB free after this cleanup; /mnt was never looked at,
+          # and run 33024091160 wrote the zip there anyway.
           FREE=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
-          echo "free=$FREE" >> "$GITHUB_OUTPUT"
-          echo "free after cleanup : ${FREE} GB"
-          sudo mkdir -p /mnt/ue
-          sudo chown "$(id -u):$(id -g)" /mnt/ue
+          FREE_MNT=$(df -BG --output=avail /mnt 2>/dev/null | tail -1 | tr -dc '0-9')
+          echo "free=$FREE"              >> "$GITHUB_OUTPUT"
+          echo "free_mnt=${FREE_MNT:-0}" >> "$GITHUB_OUTPUT"
+          echo "free after cleanup : / ${FREE} GB, /mnt ${FREE_MNT:-unknown} GB"
+          echo "--- df, both disks ---"
+          df -h / /mnt 2>&1
+          # /mnt itself is root-owned on a hosted runner, so a non-root
+          # process cannot create a file directly in it. That is curl exit
+          # 23 -- write error -- at zero seconds and zero bytes, which is
+          # exactly what run 33024091160 reported. The zip now goes into a
+          # directory this user owns, and the write test below PROVES the
+          # directory is writable instead of assuming it did the job.
+          sudo mkdir -p /mnt/dl
+          sudo chown "$(id -u):$(id -g)" /mnt/dl
+          mkdir -p /home/runner/ue
+          : > /mnt/dl/.writetest
+          W_DL=$?
+          : > /home/runner/ue/.writetest
+          W_UE=$?
+          rm -f /mnt/dl/.writetest /home/runner/ue/.writetest
+          echo "writable_dl=$W_DL" >> "$GITHUB_OUTPUT"
+          echo "writable_ue=$W_UE" >> "$GITHUB_OUTPUT"
+          echo "write test : /mnt/dl rc=$W_DL   /home/runner/ue rc=$W_UE"
+          echo "--- ownership, for the record ---"
+          ls -ld /mnt /mnt/dl /home/runner /home/runner/ue 2>&1
 
       - name: Download the prebuilt engine
         id: dl
@@ -102,18 +126,36 @@ jobs:
           # --fail so an expired signature is an error rather than a saved
           # XML error page that unzip later calls corrupt. -sS keeps the
           # progress meter out of a public log without hiding errors.
-          curl -L --fail -sS --max-time 7200 -o /mnt/ue.zip "$ZIP"
+          # The target is /mnt/dl/ue.zip, a directory this user owns.
+          # /mnt/ue.zip -- directly in root-owned /mnt -- is what returned
+          # curl 23 before a single byte moved.
+          curl -L --fail -sS --max-time 7200 \
+               -o /mnt/dl/ue.zip "$ZIP" 2>/tmp/curl.err
           RC=$?
           SECS=$(( $(date +%s) - BEGAN ))
-          MB=$(du -sm /mnt/ue.zip 2>/dev/null | cut -f1)
+          MB=$(du -sm /mnt/dl/ue.zip 2>/dev/null | cut -f1)
+          # An exit code alone cannot separate "the path was not writable"
+          # from "the signature expired", and curl's own sentence can. It
+          # can also contain the presigned URL, which is a credential, so it
+          # goes through the scrubber before it reaches this world-readable
+          # log or the committed report.
+          MSG=$(python3 "$GITHUB_WORKSPACE/work/Tools/scrub_secret.py" \
+                  --env ZIP --in /tmp/curl.err --max 400 2>/dev/null)
           echo "rc=$RC"       >> "$GITHUB_OUTPUT"
           echo "secs=$SECS"   >> "$GITHUB_OUTPUT"
           echo "mb=${MB:-0}"  >> "$GITHUB_OUTPUT"
-          echo "download rc=$RC in ${SECS}s, ${MB}MB"
+          {
+            echo "msg<<TBS_EOF"
+            echo "${MSG:-<the scrubber produced nothing>}"
+            echo "TBS_EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "download rc=$RC in ${SECS}s, ${MB:-0}MB"
+          echo "curl said : ${MSG:-<nothing>}"
           if [ "$RC" -ne 0 ]; then
-            echo "The link is presigned and short-lived. rc 22 with a 403 is"
-            echo "an EXPIRED signature, which is not the same answer as a"
-            echo "network failure. Get a fresh URL and re-run."
+            echo "rc 23 is a WRITE error: the output path, not the link."
+            echo "rc 22 with a 403 is an EXPIRED presigned signature, and"
+            echo "the fix for that one is a fresh URL in the secret."
+            echo "They are different answers. The line above says which."
           fi
 
       - name: Unzip it, then delete the zip
@@ -122,14 +164,18 @@ jobs:
         run: |
           set +e
           BEGAN=$(date +%s)
-          unzip -q /mnt/ue.zip -d /mnt/ue
+          # The zip is on /mnt and the tree lands on /, so 37 GB of archive
+          # and whatever it expands to are not asked to share one disk.
+          unzip -q /mnt/dl/ue.zip -d /home/runner/ue
           RC=$?
           SECS=$(( $(date +%s) - BEGAN ))
           echo "unzip rc=$RC in ${SECS}s"
           FREE_BEFORE_RM=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
-          rm -f /mnt/ue.zip
+          rm -f /mnt/dl/ue.zip
           FREE_AFTER_RM=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
-          MB=$(du -sm /mnt/ue 2>/dev/null | cut -f1)
+          FREE_MNT_AFTER=$(df -BG --output=avail /mnt 2>/dev/null | tail -1 | tr -dc '0-9')
+          echo "mntfree=${FREE_MNT_AFTER:-0}" >> "$GITHUB_OUTPUT"
+          MB=$(du -sm /home/runner/ue 2>/dev/null | cut -f1)
           echo "rc=$RC"           >> "$GITHUB_OUTPUT"
           echo "secs=$SECS"       >> "$GITHUB_OUTPUT"
           echo "mb=${MB:-0}"      >> "$GITHUB_OUTPUT"
@@ -138,7 +184,7 @@ jobs:
           echo "extracted ${MB}MB; free was ${FREE_BEFORE_RM}G with the zip"
           echo "still there, ${FREE_AFTER_RM}G after deleting it"
           echo "--- what the archive actually contains at the top ---"
-          ls -1 /mnt/ue | head -20
+          ls -1 /home/runner/ue | head -20
 
       - name: Find the editor
         id: find
@@ -147,14 +193,14 @@ jobs:
           set +e
           # Do not assume the zip has no wrapping directory -- look for the
           # binary rather than guessing the layout.
-          CMD=$(find /mnt/ue -maxdepth 6 -type f -name 'UnrealEditor-Cmd' \
+          CMD=$(find /home/runner/ue -maxdepth 6 -type f -name 'UnrealEditor-Cmd' \
                   2>/dev/null | head -1)
           echo "editor=$CMD" >> "$GITHUB_OUTPUT"
           if [ -z "$CMD" ]; then
             echo "NO UnrealEditor-Cmd ANYWHERE in the extracted tree."
             echo "found=no" >> "$GITHUB_OUTPUT"
             echo "--- directories two levels down, for the record ---"
-            find /mnt/ue -maxdepth 2 -type d | head -30
+            find /home/runner/ue -maxdepth 2 -type d | head -30
             exit 0
           fi
           echo "found=yes" >> "$GITHUB_OUTPUT"
@@ -204,14 +250,19 @@ jobs:
         env:
           RUN_ID:  ${{ github.run_id }}
           FREE0:   ${{ steps.room.outputs.free }}
+          FREEM:   ${{ steps.room.outputs.free_mnt }}
+          W_DL:    ${{ steps.room.outputs.writable_dl }}
+          W_UE:    ${{ steps.room.outputs.writable_ue }}
           D_RC:    ${{ steps.dl.outputs.rc }}
           D_SECS:  ${{ steps.dl.outputs.secs }}
           D_MB:    ${{ steps.dl.outputs.mb }}
+          D_MSG:   ${{ steps.dl.outputs.msg }}
           U_RC:    ${{ steps.unzip.outputs.rc }}
           U_SECS:  ${{ steps.unzip.outputs.secs }}
           U_MB:    ${{ steps.unzip.outputs.mb }}
           U_TIGHT: ${{ steps.unzip.outputs.tight }}
           U_FREE:  ${{ steps.unzip.outputs.free }}
+          U_MNT:   ${{ steps.unzip.outputs.mntfree }}
           F_FOUND: ${{ steps.find.outputs.found }}
           F_CMD:   ${{ steps.find.outputs.editor }}
           B_RC:    ${{ steps.boot.outputs.rc }}
@@ -232,19 +283,24 @@ jobs:
             echo "source     : Linux_Unreal_Engine_5.8.2.zip, 37.08 GB,"
             echo "             dated 2026-08-25, unrealengine.com/linux"
             echo "machine    : $(nproc) cores, $(free -g | awk '/^Mem:/{print $2}') GB ram"
-            echo "free at start of work : ${FREE0:-<none>} GB"
+            echo "free at start of work : / ${FREE0:-<none>} GB,"
+            echo "                        /mnt ${FREEM:-<none>} GB"
+            echo "write test, /mnt/dl        : rc ${W_DL:-<step did not run>}"
+            echo "write test, /home/runner/ue: rc ${W_UE:-<step did not run>}"
             echo ""
             echo "== download =="
             echo "rc         : ${D_RC:-<step did not run>}"
             echo "seconds    : ${D_SECS:-<none>}"
             echo "MB         : ${D_MB:-<none>}"
+            echo "curl said  : ${D_MSG:-<step did not run>}"
             echo ""
             echo "== unzip =="
             echo "rc         : ${U_RC:-<step did not run>}"
             echo "seconds    : ${U_SECS:-<none>}"
             echo "tree MB    : ${U_MB:-<none>}"
-            echo "free with the zip still present : ${U_TIGHT:-<none>} GB"
-            echo "free after deleting the zip     : ${U_FREE:-<none>} GB"
+            echo "free on /    after extraction    : ${U_TIGHT:-<none>} GB"
+            echo "free on /    after deleting zip  : ${U_FREE:-<none>} GB"
+            echo "free on /mnt after deleting zip  : ${U_MNT:-<none>} GB"
             echo ""
             echo "== the editor binary =="
             echo "found      : ${F_FOUND:-<step did not run>}"
@@ -257,9 +313,11 @@ jobs:
             echo ""
             echo "== VERDICT =="
             if [ "${D_RC}" != "0" ]; then
-              echo "NOT MEASURED past the download. A presigned URL that has"
-              echo "expired reports rc 22, and that is not the same answer as"
-              echo "'the engine does not fit' or 'the engine does not run'."
+              echo "NOT MEASURED past the download. rc ${D_RC:-<none>}, and"
+              echo "curl said: ${D_MSG:-<nothing was captured>}"
+              echo "rc 22 is an expired signature, rc 23 is a write error,"
+              echo "and neither is the same answer as 'the engine does not"
+              echo "fit' or 'the engine does not run'."
             elif [ "${U_RC}" != "0" ]; then
               echo "The archive did not extract. Check the free-space numbers"
               echo "above before blaming the archive."
