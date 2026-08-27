@@ -251,7 +251,27 @@ jobs:
             exit 0
           fi
           # No --user: the image's own user, which now owns both trees.
+          # --shm-size BECAUSE UBA ASKED FOR IT BY NAME. Run 33066212937's
+          # build printed, before it hung for an hour and died on the 3600 s
+          # timeout with rc 124:
+          #
+          #   UbaStorageServer - FileMapping backing: disk (/dev/shm 64MB <
+          #   floor 1024MB; memfd: pidfd_getfd errno=1) - this works but is
+          #   slower. ... alternatively raise --shm-size to use /dev/shm.
+          #   Using Unreal Build Accelerator local executor to run 8 action(s)
+          #   context canceled
+          #
+          # 64MB is docker's default and UBA states a 1024MB floor, so 2g.
+          # WHAT THIS DOES NOT ESTABLISH: run 33050798591 built the same
+          # module in 43.72 s on the same image with the same 64MB default,
+          # so a small shm is NOT proven to be the cause -- whether that run
+          # printed this warning is NOT MEASURED, because the step only ever
+          # tailed 40 lines of the build log and the warning is near its top.
+          # A single green build after this change therefore does not prove
+          # the change fixed anything; a hang that recurs WITH 2g does prove
+          # the shm was not it.
           docker run -d --name tbsue \
+            --shm-size=2g \
             -v "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE" \
             -w "$GITHUB_WORKSPACE" \
             --entrypoint sleep "$IMG" infinity > /tmp/run.txt 2>&1
@@ -672,6 +692,16 @@ jobs:
             echo "  33047625082 reported rc 6 in 1 second with no log in this"
             echo "  file at all, so nobody could tell a compile error from a"
             echo "  permission error without opening Actions."
+            # THE HEAD AS WELL AS THE TAIL. The toolchain banner, the UBA
+            # storage line and any warning about it all sit near the TOP of
+            # this log, and a build that hangs never reaches a tail worth
+            # having. Run 33050798591 succeeded and its report carried only
+            # `tail -40`, starting at "[4/8] Compile TBSGameMode.cpp" -- so
+            # when 33066212937 hung with a /dev/shm warning, there was no way
+            # to ask whether the successful run had printed the same warning.
+            # That question is still unanswerable for those two runs.
+            echo "--- first 30 lines of the build log ---"
+            head -30 /tmp/build.log 2>/dev/null || echo "(none)"
             echo "--- last 40 lines of the build log ---"
             tail -40 /tmp/build.log 2>/dev/null || echo "(none)"
             echo ""
