@@ -491,6 +491,13 @@ jobs:
         run: |
           set +e
           PROJ="$GITHUB_WORKSPACE/work/TehranBlindSpot.uproject"
+          # THE LOG GOES UNDER $GITHUB_WORKSPACE because that is the ONLY path
+          # bind-mounted into the container. Run 33050798591 wrote it to the
+          # CONTAINER's /tmp and this workflow tailed the HOST's /tmp, so the
+          # report printed "(none)" where the engine's own words belong. One
+          # level above work/ keeps it out of the git checkout it sits beside.
+          LOG="$GITHUB_WORKSPACE/boot.log"
+          rm -f "$LOG" /tmp/boot.stdout /tmp/boot.digests
           $PFX ls -la "$PROJ"
           BEGAN=$(date +%s)
           # -NullRHI because there is no GPU here; this asks only whether the
@@ -500,20 +507,45 @@ jobs:
           timeout 1800 $PFX "$CMD" "$PROJ" \
             -ExecutePythonScript="$GITHUB_WORKSPACE/work/Tools/probe_boot.py" \
             -unattended -nopause -nosplash -NullRHI -stdout \
-            -abslog=/tmp/boot.log > /tmp/boot.stdout 2>&1
+            -abslog="$LOG" > /tmp/boot.stdout 2>&1
           RC=$?
           SECS=$(( $(date +%s) - BEGAN ))
           echo "rc=$RC"     >> "$GITHUB_OUTPUT"
           echo "secs=$SECS" >> "$GITHUB_OUTPUT"
           echo "boot rc=$RC in ${SECS}s"
-          TBS=$(grep -c '^##TBS##' /tmp/boot.log /tmp/boot.stdout 2>/dev/null \
-                | awk -F: '{s+=$2} END {print s+0}')
-          echo "tbs=$TBS" >> "$GITHUB_OUTPUT"
+          # COUNT WHAT distill.py PARSES, NOT SOMETHING STRICTER. unreal.log()
+          # puts a timestamp and a log category in front of every line, so a
+          # digest NEVER starts a line in an engine log. Run 33050798591
+          # counted '^##TBS##' and reported 0 -- a number no emitting probe
+          # could have moved, recorded as though it were a measurement.
+          # Tools/probe_boot_digest_contract.py fails on the old pattern.
+          : > /tmp/boot.digests
+          for F in "$LOG" /tmp/boot.stdout; do
+            if [ -f "$F" ]; then
+              grep -hE '##TBS##[[:space:]]*\{' "$F" >> /tmp/boot.digests 2>/dev/null
+            fi
+          done
+          # Strip the engine prefix so each digest STARTS its own line, which
+          # is what check_digest_provenance requires of anything a report
+          # quotes. The same line appears in both streams, hence sort -u.
+          sed -i 's/^.*\(##TBS##\)/\1/' /tmp/boot.digests
+          sort -u /tmp/boot.digests -o /tmp/boot.digests
+          TBS=$(wc -l < /tmp/boot.digests | tr -d " ")
+          # A FILE THAT IS NOT THERE AND A FILE WITH NO DIGESTS IN IT ARE
+          # DIFFERENT ANSWERS. Zero on its own cannot tell them apart.
+          if [ -f "$LOG" ]; then LOGSEEN=yes; else LOGSEEN=no; fi
+          if [ -f /tmp/boot.stdout ]; then OUTSEEN=yes; else OUTSEEN=no; fi
+          echo "tbs=$TBS"         >> "$GITHUB_OUTPUT"
+          echo "logseen=$LOGSEEN" >> "$GITHUB_OUTPUT"
+          echo "outseen=$OUTSEEN" >> "$GITHUB_OUTPUT"
           echo "##TBS## lines produced : $TBS"
+          echo "editor log file present : $LOGSEEN ; stdout captured : $OUTSEEN"
+          echo "--- the digest lines themselves ---"
+          cat /tmp/boot.digests
           echo "--- last 60 lines the editor printed ---"
           tail -60 /tmp/boot.stdout 2>/dev/null
           echo "--- last 40 lines of its own log ---"
-          tail -40 /tmp/boot.log 2>/dev/null
+          tail -40 "$LOG" 2>/dev/null
 
       - name: Hand the workspace back to the runner user
         if: ${{ always() }}
@@ -565,6 +597,8 @@ jobs:
           B_RC:    ${{ steps.boot.outputs.rc }}
           B_SECS:  ${{ steps.boot.outputs.secs }}
           B_TBS:   ${{ steps.boot.outputs.tbs }}
+          B_LOGSEEN: ${{ steps.boot.outputs.logseen }}
+          B_OUTSEEN: ${{ steps.boot.outputs.outseen }}
           DO_COMMIT: ${{ inputs.commit }}
           BRANCH:  ${{ vars.TBS_BRANCH || 'claude/gateway-auth-fix-nr7k0b' }}
         run: |
@@ -645,6 +679,15 @@ jobs:
             echo "rc         : ${B_RC:-<step did not run>}"
             echo "seconds    : ${B_SECS:-<none>}"
             echo "##TBS## lines : ${B_TBS:-<none>}"
+            echo "editor log file present : ${B_LOGSEEN:-<step did not run>}"
+            echo "stdout captured         : ${B_OUTSEEN:-<step did not run>}"
+            echo "  A count of 0 with the log ABSENT is a failure to capture,"
+            echo "  not a probe that stayed silent. Run 33050798591 could not"
+            echo "  tell those apart: it counted '^##TBS##' against a log that"
+            echo "  was written inside the container, and an engine log never"
+            echo "  starts a line with the marker anyway."
+            echo "--- every ##TBS## line the boot produced ---"
+            cat /tmp/boot.digests 2>/dev/null || echo "(none)"
             echo ""
             echo "== VERDICT =="
             if [ "${C_RC:-x}" != "0" ] && [ "${C_RC:-x}" != "x" ]; then
@@ -686,11 +729,19 @@ jobs:
             elif [ "${F_FOUND}" != "yes" ]; then
               echo "The engine arrived, and there is NO UnrealEditor-Cmd in"
               echo "it. Whatever this ${SRC} is, it is not a runnable editor."
+            elif [ "${B_RC}" = "0" ] && [ "${B_TBS:-0}" -gt 0 ]; then
+              echo "THE EDITOR STARTS ON A GITHUB RUNNER AND OUR PROBE RAN"
+              echo "INSIDE IT: ${B_TBS} ##TBS## lines, printed above. First"
+              echo "time in this project that Unreal has run anywhere but the"
+              echo "laptop. This says nothing about RENDERING: the run was"
+              echo "-NullRHI, and there is no GPU on this machine."
             elif [ "${B_RC}" = "0" ]; then
-              echo "THE EDITOR STARTS ON A GITHUB RUNNER. First time in this"
-              echo "project that Unreal has run anywhere but the laptop."
-              echo "This says nothing about RENDERING: the run was -NullRHI,"
-              echo "and there is no GPU on this machine."
+              echo "THE EDITOR STARTED AND EXITED 0, AND NOTHING PROVES OUR"
+              echo "PROBE RAN INSIDE IT: zero ##TBS## lines. The editor"
+              echo "booting and Tools/probe_boot.py executing are DIFFERENT"
+              echo "QUESTIONS and only the first is answered here. Read the"
+              echo "two presence flags above before reading this as silence"
+              echo "from the probe."
             else
               echo "The engine is here and the binary is there, but the"
               echo "editor did not exit 0. Its own output is below; read it"
@@ -704,7 +755,7 @@ jobs:
             tail -60 /tmp/boot.stdout 2>/dev/null || echo "(none)"
             echo ""
             echo "== last 60 lines of the editor's log =="
-            tail -60 /tmp/boot.log 2>/dev/null || echo "(none)"
+            tail -60 "$GITHUB_WORKSPACE/boot.log" 2>/dev/null || echo "(none)"
           } > "$OUT"
           echo "wrote $OUT"
 
@@ -752,13 +803,29 @@ jobs:
             echo "NOT MEASURED. A secret is missing; nothing ran."
             exit 1
           fi
-          if [ "${{ steps.dl.outputs.rc }}" != "0" ]; then
-            echo "download rc=${{ steps.dl.outputs.rc }} -- see the report."
-            exit 1
-          fi
-          if [ "${{ steps.unzip.outputs.rc }}" != "0" ]; then
-            echo "unzip rc=${{ steps.unzip.outputs.rc }} -- see the report."
-            exit 1
+          # BRANCH ON THE ROUTE BEFORE COMPARING ANYTHING. On the image
+          # route the download and unzip steps never run, so their rc outputs
+          # are the EMPTY STRING, and [ "" != "0" ] is true. Before this the
+          # first test in the step fired on every image run and called a good
+          # run a failed download -- the same bug that was fixed one step away
+          # in the report's own verdict text and left standing here.
+          if [ "${{ inputs.source }}" = "image" ]; then
+            if [ "${{ steps.pull.outputs.rc }}" != "0" ]; then
+              echo "pull rc=${{ steps.pull.outputs.rc }} -- see the report."
+              echo "rc 70 is a credential, rc 71 is an image with no editor,"
+              echo "rc 73/74/75/76/77/78 are the container, the mount and the"
+              echo "uid. None of them is 'the engine does not run'."
+              exit 1
+            fi
+          else
+            if [ "${{ steps.dl.outputs.rc }}" != "0" ]; then
+              echo "download rc=${{ steps.dl.outputs.rc }} -- see the report."
+              exit 1
+            fi
+            if [ "${{ steps.unzip.outputs.rc }}" != "0" ]; then
+              echo "unzip rc=${{ steps.unzip.outputs.rc }} -- see the report."
+              exit 1
+            fi
           fi
           if [ "${{ steps.find.outputs.found }}" != "yes" ]; then
             echo "no UnrealEditor-Cmd in the extracted tree."
@@ -774,4 +841,12 @@ jobs:
             echo "That is a real result and it is in the report."
             exit 1
           fi
-          echo "prebuilt engine unpacked and started on a hosted runner"
+          if [ "${{ inputs.boot }}" = "true" ] \
+             && [ "${{ steps.boot.outputs.tbs }}" = "0" ]; then
+            echo "the editor exited 0 and produced NO ##TBS## line, so"
+            echo "nothing here proves Tools/probe_boot.py ran inside it."
+            echo "That is a gap in the measurement, not a failed engine."
+            exit 1
+          fi
+          echo "prebuilt engine unpacked and started on a hosted runner,"
+          echo "and our own probe ran inside it: ${{ steps.boot.outputs.tbs }} ##TBS## lines."
