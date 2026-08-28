@@ -490,8 +490,35 @@ jobs:
           BEGAN=$(date +%s)
           # TehranBlindSpotEditor, not TehranBlindSpot: the Editor target is
           # the one UnrealEditor-Cmd loads, and it is what every probe needs.
+          # -NoUba: UNREAL BUILD ACCELERATOR IS OFF, and the shm hypothesis
+          # is DEAD. Five builds now, and --shm-size did not separate them:
+          #
+          #   64MB   /dev/shm fallback   43.72 s  ok    33050798591
+          #   64MB   /dev/shm fallback   3600 s   HUNG  33066212937
+          #   2048MB /dev/shm            61 s     ok    33090067823
+          #   2048MB /dev/shm            61 s     ok    33093349034
+          #   2048MB /dev/shm            3600 s   HUNG  33145205106
+          #
+          # Both sizes both succeeded and hung, so the shm was never the
+          # cause -- exactly the falsification promised when 2g was added.
+          #
+          # WHAT THE EVIDENCE DOES POINT AT: both hangs stop dead immediately
+          # after UBA starts. 33145205106's build log ends at "UbaServer -
+          # Listening on 0.0.0.0:1345" / "run 8 action(s)" and then an hour
+          # of nothing; 33066212937 added "context canceled" there and did
+          # the same. UBA is the last subsystem alive in both.
+          #
+          # AND IT BUYS NOTHING HERE. It is a distributed build accelerator
+          # being asked to coordinate EIGHT actions across TWO cores. Turning
+          # it off removes a whole subsystem from the critical path whether
+          # or not it is the culprit, which is why this is justified on its
+          # own merits and not only as a fix.
+          #
+          # A GREEN BUILD AFTER THIS PROVES NOTHING ON ITS OWN, for the same
+          # reason 2g proved nothing: two of five runs hung, so three greens
+          # in a row is the least that would even be suggestive.
           timeout 3600 $PFX "$BUILD" TehranBlindSpotEditor Linux Development \
-            -project="$PROJ" -waitmutex > /tmp/build.log 2>&1
+            -project="$PROJ" -waitmutex -NoUba > /tmp/build.log 2>&1
           RC=$?
           SECS=$(( $(date +%s) - BEGAN ))
           echo "rc=$RC"     >> "$GITHUB_OUTPUT"
