@@ -686,9 +686,17 @@ jobs:
           # them into one -- which is the failure this project makes more than
           # any other. The header names the search, so a zero is a RECORDED
           # zero and a missing file means the step did not run.
-          mkdir -p "$GITHUB_WORKSPACE/work/Reports/cloud_host"
-          VPF="$GITHUB_WORKSPACE/work/Reports/cloud_host/vp_ue_vulkan_sm5.txt"
-          VKF="$GITHUB_WORKSPACE/work/Reports/cloud_host/lavapipe_vulkaninfo.txt"
+          # $RUNNER_TEMP, NOT THE WORKSPACE. Run 33200211918 wrote three
+          # `Permission denied` lines here and produced no dump at all. The
+          # cause is two steps up: `sudo chown -R ${UEUID}:${UEGID}
+          # "$GITHUB_WORKSPACE"` hands the whole workspace to the IMAGE'S user
+          # so Unreal will start (it refuses to run as root), and the chown
+          # BACK does not happen until the report step, which is why the
+          # report writes into the same directory perfectly well and this step
+          # cannot. $RUNNER_TEMP belongs to the runner user the whole time.
+          # The report step copies these in after it chowns back.
+          VPF="$RUNNER_TEMP/vp_ue_vulkan_sm5.txt"
+          VKF="$RUNNER_TEMP/lavapipe_vulkaninfo.txt"
           # NO EXTENSION FILTER. Run 33160904128 searched --include=*.json and
           # answered "<not found>": VP_UE_Vulkan_SM5 is NOT a json in the
           # tree. Vulkan profiles are commonly GENERATED INTO A C++ HEADER,
@@ -707,7 +715,15 @@ jobs:
             cat /tmp/profhits.txt 2>/dev/null
             echo "--- contents of the first hit ---"
           } > "$VPF"
-          PROF=$(head -1 /tmp/profhits.txt 2>/dev/null)
+          # PREFER A SOURCE FILE. The 14 hits from run 33200211918 were 13
+          # COMPILED BINARIES -- Module.VulkanRHI.4.cpp.o, UnrealGame,
+          # libUnrealEditor-VulkanRHI.so -- and one header:
+          #   Engine/Source/ThirdParty/Vulkan/profiles/include/vulkan_profiles_ue.h
+          # `head -1` would have dumped an object file as "the profile". A
+          # binary that contains the string is not the definition of it.
+          PROF=$(grep -E '\.(h|hpp|json|cpp)$' /tmp/profhits.txt | head -1)
+          [ -z "$PROF" ] && PROF=$(head -1 /tmp/profhits.txt 2>/dev/null)
+          echo "profile source chosen : ${PROF:-<none>}"
           if [ -n "$PROF" ]; then
             $PFX cat "$PROF" >> "$VPF" 2>/dev/null
           else
@@ -1102,6 +1118,15 @@ jobs:
           # all. The vk step now always writes a header naming the search and
           # its hit count, so an empty result is impossible and a MISSING file
           # means one thing only: that step did not run.
+          # COPIED IN HERE, from $RUNNER_TEMP, because the vk step could not
+          # write into the workspace: it runs while the tree belongs to the
+          # image's user. By this point the chown back has happened, which is
+          # why the report file above lands without trouble.
+          for N in vp_ue_vulkan_sm5 lavapipe_vulkaninfo; do
+            if [ -f "$RUNNER_TEMP/$N.txt" ]; then
+              cp "$RUNNER_TEMP/$N.txt" "Reports/cloud_host/$N.txt"
+            fi
+          done
           for F in Reports/cloud_host/vp_ue_vulkan_sm5.txt \
                    Reports/cloud_host/lavapipe_vulkaninfo.txt; do
             [ -f "$F" ] && git add -f "$F"
