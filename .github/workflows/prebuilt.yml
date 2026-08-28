@@ -727,8 +727,10 @@ jobs:
             -printf '  %10s  %p\n' 2>/dev/null | head -20
           echo "--- the digest lines themselves ---"
           cat /tmp/render.digests
-          echo "--- last 40 lines the editor printed ---"
-          tail -40 /tmp/render.stdout 2>/dev/null
+          echo "--- last 60 lines the editor printed ---"
+          tail -60 /tmp/render.stdout 2>/dev/null
+          echo "--- last 60 lines of the editor's OWN log ---"
+          tail -60 "$LOG" 2>/dev/null
 
       - name: Hand the workspace back to the runner user
         if: ${{ always() }}
@@ -912,6 +914,15 @@ jobs:
             echo "  different claims."
             echo "--- every ##TBS## line the render produced ---"
             cat /tmp/render.digests 2>/dev/null || echo "(none)"
+            echo "--- last 40 lines the render printed ---"
+            tail -40 /tmp/render.stdout 2>/dev/null || echo "(none)"
+            echo "--- last 40 lines of the render editor's OWN log ---"
+            tail -40 "$GITHUB_WORKSPACE/render.log" 2>/dev/null || echo "(none)"
+            echo "  ADDED after run 33151148400 reported render rc 1 with a"
+            echo "  green build above it and NO WAY TO SEE WHY. The editor's"
+            echo "  own log was written and never printed, so the cause was"
+            echo "  not measured -- the same gap fixed for the boot step and"
+            echo "  repeated here."
             echo ""
             echo "== VERDICT =="
             if [ "${C_RC:-x}" != "0" ] && [ "${C_RC:-x}" != "x" ]; then
