@@ -688,6 +688,20 @@ jobs:
           PROJ="$GITHUB_WORKSPACE/work/TehranBlindSpot.uproject"
           LOG="$GITHUB_WORKSPACE/render.log"
           rm -f "$LOG" /tmp/render.stdout /tmp/render.digests
+          # -LogCmds="LogVulkanRHI Verbose" BECAUSE THE ENGINE REJECTED THE
+          # DEVICE AND WOULD NOT SAY WHY. Run 33151148400: lavapipe was
+          # installed, the loader enumerated it (cpu devices=1), and Unreal
+          # answered
+          #
+          #   LogVulkanRHI: Warning: None of the 1 devices meet all the criteria!
+          #   LogRHI: Display: Skipping SF_VULKAN_SM5...
+          #
+          # and exited. So the engine SAW the software device and refused it
+          # for failing the SM5 criteria -- and the whole job log names no
+          # feature, extension or limit. Verbose is what makes the device
+          # selection print its reasons. This is a DIAGNOSTIC, not a fix: it
+          # buys the name of the missing criterion and nothing else.
+          #
           # NO -NullRHI. That flag is the whole difference between the boot
           # step above and this one: it means no RHI at all, so nothing can
           # render. The flags here are the ones Tools/ue.py already uses for
@@ -701,6 +715,7 @@ jobs:
           timeout 2400 $PFX "$CMD" "$PROJ" \
             -ExecutePythonScript="$GITHUB_WORKSPACE/work/Tools/probe_district.py" \
             -RenderOffScreen -ResX=1280 -ResY=720 \
+            -LogCmds="LogVulkanRHI Verbose" \
             -unattended -nopause -nosplash -stdout \
             -abslog="$LOG" > /tmp/render.stdout 2>&1
           RC=$?
