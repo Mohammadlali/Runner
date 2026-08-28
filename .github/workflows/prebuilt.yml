@@ -672,34 +672,63 @@ jobs:
           # Run 33158541672 named the mechanism and not the reason:
           #   LogVulkanRHI: Starting Vulkan Profile check for VP_UE_Vulkan_SM5:
           #   LogVulkanRHI: Warning: None of the 1 devices meet all the criteria!
-          # A Vulkan PROFILE is a JSON requirement list shipped in the engine
-          # tree, so the failing clause is readable without another guess:
-          # dump the profile Epic requires and what lavapipe actually offers,
-          # and diff them off the runner. Neither goes in the report body --
-          # both are large -- so they are committed as their own files.
+          # A Vulkan PROFILE is a requirement list shipped in the engine tree,
+          # so the failing clause is readable without another guess: dump what
+          # Epic requires and what lavapipe actually offers, and diff them off
+          # the runner. Neither goes in the report body -- both are large --
+          # so they are committed as their own files.
+          #
+          # BOTH FILES ARE WRITTEN UNCONDITIONALLY, HEADER FIRST. Before this,
+          # an empty result wrote no file at all and the commit step skipped
+          # any file that was not `-s`, so a missing dump meant EITHER that
+          # this code never ran on the runner OR that it ran and found
+          # nothing. Those are different answers and the absence collapsed
+          # them into one -- which is the failure this project makes more than
+          # any other. The header names the search, so a zero is a RECORDED
+          # zero and a missing file means the step did not run.
           mkdir -p "$GITHUB_WORKSPACE/work/Reports/cloud_host"
+          VPF="$GITHUB_WORKSPACE/work/Reports/cloud_host/vp_ue_vulkan_sm5.txt"
+          VKF="$GITHUB_WORKSPACE/work/Reports/cloud_host/lavapipe_vulkaninfo.txt"
           # NO EXTENSION FILTER. Run 33160904128 searched --include=*.json and
           # answered "<not found>": VP_UE_Vulkan_SM5 is NOT a json in the
           # tree. Vulkan profiles are commonly GENERATED INTO A C++ HEADER,
-          # so the search now takes any file type and reports every hit,
-          # because where it lives is itself the finding.
+          # so the search takes any file type and reports every hit, because
+          # where it lives is itself the finding.
           $PFX sh -c 'grep -rl "VP_UE_Vulkan_SM5" /home/ue4/UnrealEngine/Engine 2>/dev/null | head -20' \
             > /tmp/profhits.txt 2>/dev/null
-          echo "--- files naming VP_UE_Vulkan_SM5 ---"
-          cat /tmp/profhits.txt 2>/dev/null || echo "(none)"
+          HITS=$(grep -c . /tmp/profhits.txt 2>/dev/null)
+          echo "--- files naming VP_UE_Vulkan_SM5 (${HITS:-0}) ---"
+          cat /tmp/profhits.txt 2>/dev/null
+          {
+            echo "search  : grep -rl VP_UE_Vulkan_SM5 /home/ue4/UnrealEngine/Engine"
+            echo "run     : ${GITHUB_RUN_ID}"
+            echo "hits    : ${HITS:-0}"
+            echo "--- every file that named it ---"
+            cat /tmp/profhits.txt 2>/dev/null
+            echo "--- contents of the first hit ---"
+          } > "$VPF"
           PROF=$(head -1 /tmp/profhits.txt 2>/dev/null)
           if [ -n "$PROF" ]; then
-            $PFX cat "$PROF" \
-              > "$GITHUB_WORKSPACE/work/Reports/cloud_host/vp_ue_vulkan_sm5.txt" 2>/dev/null
-            echo "profile source bytes : $(wc -c < "$GITHUB_WORKSPACE/work/Reports/cloud_host/vp_ue_vulkan_sm5.txt" 2>/dev/null)"
+            $PFX cat "$PROF" >> "$VPF" 2>/dev/null
+          else
+            echo "(no file in the engine tree names VP_UE_Vulkan_SM5. This is" >> "$VPF"
+            echo " a MEASURED ZERO from the search above, not a step that was" >> "$VPF"
+            echo " skipped. The profile may be built at runtime rather than" >> "$VPF"
+            echo " stored, in which case the engine source, not the tree, is" >> "$VPF"
+            echo " where the clause lives.)" >> "$VPF"
           fi
+          echo "profile file bytes : $(wc -c < "$VPF" 2>/dev/null)"
           # PLAIN TEXT, NOT --json. Run 33160904128 got zero bytes from
           # `vulkaninfo --json` while `--summary` had worked moments earlier,
           # so this build of vulkaninfo does not serve that switch. The full
           # text output carries the same features and limits.
-          $PFX sh -c 'vulkaninfo 2>&1' \
-            > "$GITHUB_WORKSPACE/work/Reports/cloud_host/lavapipe_vulkaninfo.txt" 2>/dev/null
-          echo "device text bytes : $(wc -c < "$GITHUB_WORKSPACE/work/Reports/cloud_host/lavapipe_vulkaninfo.txt" 2>/dev/null)"
+          {
+            echo "command : vulkaninfo"
+            echo "run     : ${GITHUB_RUN_ID}"
+            echo "---"
+          } > "$VKF"
+          $PFX sh -c 'vulkaninfo 2>&1' >> "$VKF" 2>/dev/null
+          echo "device text bytes : $(wc -c < "$VKF" 2>/dev/null)"
           echo "cpu_devices=$CPU_DEV" >> "$GITHUB_OUTPUT"
           echo "gpu_devices=$GPU_DEV" >> "$GITHUB_OUTPUT"
           if [ "${CPU_DEV:-0}" = "0" ] && [ "${GPU_DEV:-0}" = "0" ]; then
@@ -1066,9 +1095,16 @@ jobs:
           # what turn "none of the devices meet all the criteria" into a named
           # clause, and they cannot be read from the cloud side any other way:
           # the engine tree lives inside the image.
+          #
+          # `-f`, NOT `-s`. The old guard skipped any file that was not
+          # non-empty, so a search that ran and found nothing produced exactly
+          # the same absence as a runner whose workflow had no dump step at
+          # all. The vk step now always writes a header naming the search and
+          # its hit count, so an empty result is impossible and a MISSING file
+          # means one thing only: that step did not run.
           for F in Reports/cloud_host/vp_ue_vulkan_sm5.txt \
                    Reports/cloud_host/lavapipe_vulkaninfo.txt; do
-            [ -s "$F" ] && git add -f "$F"
+            [ -f "$F" ] && git add -f "$F"
           done
           git commit -m "prebuilt engine: measured on the public runner, run ${RUN_ID}"
           if [ $? -ne 0 ]; then
