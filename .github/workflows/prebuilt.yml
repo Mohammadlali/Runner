@@ -597,6 +597,21 @@ jobs:
           # kaggle_vulkan_2026-08-26.CORRECTION.md exists because a digest
           # reported "supplied" when only llvmpipe was present. So this step
           # reports the DEVICE TYPE and never collapses it into a yes.
+          # INSTALL THE SOFTWARE DRIVER FIRST. Run 33097623293 measured rc 81
+          # on this image: a Vulkan LOADER is present and there is NO ICD in
+          # /usr/share/vulkan/icd.d at all. A loader is not a driver, it finds
+          # one, so nothing could render -- not for want of a GPU but for want
+          # of a package. mesa-vulkan-drivers provides lavapipe, the SOFTWARE
+          # Vulkan driver, and vulkan-tools provides vulkaninfo.
+          #
+          # -u 0 FOR THE INSTALL ONLY. apt needs root; Unreal refuses to run
+          # as root and said so in run 33049314055. Those are different
+          # commands and only this one gets root.
+          $PFX true 2>/dev/null && docker exec -u 0 tbsue sh -c \
+            'apt-get update -qq && apt-get install -y -qq mesa-vulkan-drivers vulkan-tools' \
+            > /tmp/vkinstall.txt 2>&1
+          echo "driver install rc=$? (see the tail below if it is non-zero)"
+          tail -3 /tmp/vkinstall.txt 2>/dev/null
           LOADER=$($PFX sh -c 'ls /usr/lib/x86_64-linux-gnu/libvulkan.so.1 2>/dev/null | head -1')
           echo "vulkan loader : ${LOADER:-<none>}"
           if [ -z "$LOADER" ]; then
@@ -610,8 +625,11 @@ jobs:
           echo "icd files     : ${ICDS:-<none>}"
           if [ -z "$ICDS" ]; then
             echo "rc=81" >> "$GITHUB_OUTPUT"
-            echo "a loader with NO ICD. The loader is not a driver; it finds"
-            echo "one. rc 81."
+            echo "a loader with NO ICD, AFTER the install step above ran."
+            echo "The loader is not a driver; it finds one. Read the install"
+            echo "rc and its tail before concluding anything about the image:"
+            echo "an apt failure and an image that cannot host lavapipe are"
+            echo "different answers. rc 81."
             exit 0
           fi
           $PFX sh -c 'command -v vulkaninfo >/dev/null && vulkaninfo --summary' \
