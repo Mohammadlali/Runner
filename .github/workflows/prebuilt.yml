@@ -169,10 +169,41 @@ jobs:
             exit 0
           fi
           echo "logged in to ghcr.io."
-          docker pull "$IMG" > /tmp/pull.txt 2>&1
-          RC=$?
+          # THREE ATTEMPTS, BECAUSE GHCR RATE-LIMITS AND A SINGLE SHOT TURNS
+          # THAT INTO A DEAD RUN. Run 33203227534 pulled this 22.9 GB image
+          # for the fourth time in one afternoon and got
+          #
+          #   toomanyrequests: {"errors":[{"code":"TOOMANYREQUESTS",
+          #                     "message":"retry-after: 238.028883ms"}]}
+          #
+          # after 49 s. Every step below is gated on this one, so the whole
+          # run -- build, boot, the Vulkan dumps the run existed for --
+          # was skipped over a limit whose own retry-after was a fifth of a
+          # second. The wait here is far longer than that on purpose: the
+          # header names the delay for ONE request, and what we need is for a
+          # burst of them to age out.
+          #
+          # A RETRY IS ONLY HONEST FOR A NAMED TRANSIENT. This one retries
+          # any non-zero rc but SAYS which attempt succeeded and prints every
+          # failure, so a run that needed three goes cannot be read as a run
+          # that needed one. It does not retry a login refusal -- that is
+          # handled above and is a credential, not a queue.
+          RC=1
+          for TRY in 1 2 3; do
+            docker pull "$IMG" > /tmp/pull.txt 2>&1
+            RC=$?
+            [ $RC -eq 0 ] && break
+            echo "pull attempt $TRY failed (rc $RC). Its last lines:"
+            tail -3 /tmp/pull.txt
+            if [ $TRY -lt 3 ]; then
+              WAIT=$(( TRY * 120 ))
+              echo "waiting ${WAIT}s before attempt $(( TRY + 1 ))"
+              sleep "$WAIT"
+            fi
+          done
+          echo "pull_tries=$TRY" >> "$GITHUB_OUTPUT"
           SECS=$(( $(date +%s) - BEGAN ))
-          echo "pull rc=$RC in ${SECS}s"
+          echo "pull rc=$RC in ${SECS}s after $TRY attempt(s)"
           if [ $RC -ne 0 ]; then
             echo "rc=$RC" >> "$GITHUB_OUTPUT"
             echo "the pull failed. Its own last lines:"
@@ -851,6 +882,7 @@ jobs:
           W_UE:    ${{ steps.room.outputs.writable_ue }}
           SRC:     ${{ inputs.source }}
           P_RC:    ${{ steps.pull.outputs.rc }}
+          P_TRIES: ${{ steps.pull.outputs.pull_tries }}
           P_SECS:  ${{ steps.pull.outputs.secs }}
           P_DF:    ${{ steps.pull.outputs.dockerdf }}
           P_FREE:  ${{ steps.pull.outputs.free }}
@@ -907,6 +939,10 @@ jobs:
             echo ""
             echo "== pull, ghcr.io/epicgames/unreal-engine:dev-slim-5.8.2 =="
             echo "rc            : ${P_RC:-<step did not run>}"
+            echo "pull attempts : ${P_TRIES:-<none>} of 3 -- more
+                            than 1 means ghcr.io rate-limited us and
+                            the retry recovered it, which is NOT the
+                            same run as one that pulled first time"
             echo "pull seconds  : ${P_SECS:-<none>}"
             echo "docker on disk: ${P_DF:-<none>}"
             echo "free on /     : ${P_FREE:-<none>} GB"
