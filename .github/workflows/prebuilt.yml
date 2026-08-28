@@ -678,16 +678,28 @@ jobs:
           # and diff them off the runner. Neither goes in the report body --
           # both are large -- so they are committed as their own files.
           mkdir -p "$GITHUB_WORKSPACE/work/Reports/cloud_host"
-          PROF=$($PFX sh -c 'grep -rl "VP_UE_Vulkan_SM5" /home/ue4/UnrealEngine/Engine --include=*.json 2>/dev/null | head -1')
-          echo "profile json inside the image : ${PROF:-<not found>}"
+          # NO EXTENSION FILTER. Run 33160904128 searched --include=*.json and
+          # answered "<not found>": VP_UE_Vulkan_SM5 is NOT a json in the
+          # tree. Vulkan profiles are commonly GENERATED INTO A C++ HEADER,
+          # so the search now takes any file type and reports every hit,
+          # because where it lives is itself the finding.
+          $PFX sh -c 'grep -rl "VP_UE_Vulkan_SM5" /home/ue4/UnrealEngine/Engine 2>/dev/null | head -20' \
+            > /tmp/profhits.txt 2>/dev/null
+          echo "--- files naming VP_UE_Vulkan_SM5 ---"
+          cat /tmp/profhits.txt 2>/dev/null || echo "(none)"
+          PROF=$(head -1 /tmp/profhits.txt 2>/dev/null)
           if [ -n "$PROF" ]; then
             $PFX cat "$PROF" \
-              > "$GITHUB_WORKSPACE/work/Reports/cloud_host/vp_ue_vulkan_sm5.json" 2>/dev/null
-            echo "profile bytes : $(wc -c < "$GITHUB_WORKSPACE/work/Reports/cloud_host/vp_ue_vulkan_sm5.json" 2>/dev/null)"
+              > "$GITHUB_WORKSPACE/work/Reports/cloud_host/vp_ue_vulkan_sm5.txt" 2>/dev/null
+            echo "profile source bytes : $(wc -c < "$GITHUB_WORKSPACE/work/Reports/cloud_host/vp_ue_vulkan_sm5.txt" 2>/dev/null)"
           fi
-          $PFX sh -c 'vulkaninfo --json 2>/dev/null' \
-            > "$GITHUB_WORKSPACE/work/Reports/cloud_host/lavapipe_vulkaninfo.json" 2>/dev/null
-          echo "device json bytes : $(wc -c < "$GITHUB_WORKSPACE/work/Reports/cloud_host/lavapipe_vulkaninfo.json" 2>/dev/null)"
+          # PLAIN TEXT, NOT --json. Run 33160904128 got zero bytes from
+          # `vulkaninfo --json` while `--summary` had worked moments earlier,
+          # so this build of vulkaninfo does not serve that switch. The full
+          # text output carries the same features and limits.
+          $PFX sh -c 'vulkaninfo 2>&1' \
+            > "$GITHUB_WORKSPACE/work/Reports/cloud_host/lavapipe_vulkaninfo.txt" 2>/dev/null
+          echo "device text bytes : $(wc -c < "$GITHUB_WORKSPACE/work/Reports/cloud_host/lavapipe_vulkaninfo.txt" 2>/dev/null)"
           echo "cpu_devices=$CPU_DEV" >> "$GITHUB_OUTPUT"
           echo "gpu_devices=$GPU_DEV" >> "$GITHUB_OUTPUT"
           if [ "${CPU_DEV:-0}" = "0" ] && [ "${GPU_DEV:-0}" = "0" ]; then
@@ -1054,8 +1066,8 @@ jobs:
           # what turn "none of the devices meet all the criteria" into a named
           # clause, and they cannot be read from the cloud side any other way:
           # the engine tree lives inside the image.
-          for F in Reports/cloud_host/vp_ue_vulkan_sm5.json \
-                   Reports/cloud_host/lavapipe_vulkaninfo.json; do
+          for F in Reports/cloud_host/vp_ue_vulkan_sm5.txt \
+                   Reports/cloud_host/lavapipe_vulkaninfo.txt; do
             [ -s "$F" ] && git add -f "$F"
           done
           git commit -m "prebuilt engine: measured on the public runner, run ${RUN_ID}"
