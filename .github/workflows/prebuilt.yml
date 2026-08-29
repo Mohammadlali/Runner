@@ -776,6 +776,81 @@ jobs:
           } > "$VKF"
           $PFX sh -c 'vulkaninfo 2>&1' >> "$VKF" 2>/dev/null
           echo "device text bytes : $(wc -c < "$VKF" 2>/dev/null)"
+          # ------------------------------------------------------------------
+          # WHERE THE REFUSAL ACTUALLY COMES FROM, and a LIKE-FOR-LIKE device
+          # read. Run 33204569737 settled that it is NOT the profile: the whole
+          # of VP_UE_Vulkan_SM5 is three conditions -- apiVersion >= 1.1.0,
+          # fragmentStoresAndAtomics == VK_TRUE, maxBoundDescriptorSets >= 4,
+          # with extensions, formats and queue families all `0, nullptr` -- and
+          # lavapipe answers 1.3.255, true and 8. All three pass, and the engine
+          # still says "None of the 1 devices meet all the criteria!".
+          #
+          # So this asks the two questions that are left, in ONE pull, because
+          # a pull is 22.9 GB and nothing persists between jobs:
+          #
+          #   A. which code emits that sentence, and what else it tests. The
+          #      message is the only thread back to the real criteria.
+          #   B. what the device looks like through the ENGINE'S OWN loader.
+          #      The engine logs `Using included Vulkan loader` at instance
+          #      1.3.204 from Engine/Binaries/ThirdParty/Vulkan/Linux, while
+          #      vulkaninfo read the device through the SYSTEM loader at
+          #      1.3.255. The two dumps we have are therefore NOT strictly
+          #      comparable, and a difference is a candidate.
+          #
+          # $RUNNER_TEMP again, never the workspace: the tree belongs to the
+          # image's user until the report step chowns back, and run 33200211918
+          # lost both dumps to exactly that.
+          DGF="$RUNNER_TEMP/engine_device_criteria.txt"
+          {
+            echo "run     : ${GITHUB_RUN_ID}"
+            echo "purpose : the refusal is NOT the profile (run 33204569737)."
+            echo "          A: what code emits the sentence and what it tests."
+            echo "          B: the device through the ENGINE'S bundled loader."
+            echo ""
+            echo "== A. every source file carrying the refusal message =="
+          } > "$DGF"
+          $PFX sh -c 'grep -rn "meet all the criteria" /home/ue4/UnrealEngine/Engine/Source 2>/dev/null | head -10' \
+            >> "$DGF" 2>&1
+          {
+            echo ""
+            echo "== A2. the device-selection neighbourhood =="
+            echo "(grep -n on VulkanRHI for the selection and profile calls;"
+            echo " a count of 0 with the tree ABSENT is a failure to measure,"
+            echo " so the tree is listed first.)"
+            echo "--- does the source tree exist at all ---"
+          } >> "$DGF"
+          $PFX sh -c 'ls -d /home/ue4/UnrealEngine/Engine/Source/Runtime/VulkanRHI 2>&1; ls /home/ue4/UnrealEngine/Engine/Source/Runtime/VulkanRHI/Private 2>&1 | head -20' \
+            >> "$DGF" 2>&1
+          {
+            echo "--- lines naming the profile check or device selection ---"
+          } >> "$DGF"
+          $PFX sh -c 'grep -rn "vpGetPhysicalDeviceProfileSupport\|GetPhysicalDeviceProfileSupport\|meet all the criteria\|SupportsProfile\|IsDeviceSuitable" /home/ue4/UnrealEngine/Engine/Source/Runtime/VulkanRHI 2>/dev/null | head -30' \
+            >> "$DGF" 2>&1
+          {
+            echo ""
+            echo "== A3. 160 lines around the first hit, whichever file it is =="
+          } >> "$DGF"
+          $PFX sh -c 'F=$(grep -rl "meet all the criteria" /home/ue4/UnrealEngine/Engine/Source 2>/dev/null | head -1); if [ -n "$F" ]; then echo "file: $F"; N=$(grep -n "meet all the criteria" "$F" | head -1 | cut -d: -f1); A=$((N-120)); [ $A -lt 1 ] && A=1; sed -n "${A},$((N+40))p" "$F"; else echo "(no source file carries that string -- it may live only in a compiled binary, which is itself the finding)"; fi' \
+            >> "$DGF" 2>&1
+          {
+            echo ""
+            echo "== B. the device through the ENGINE'S OWN bundled loader =="
+            echo "LD_LIBRARY_PATH is pointed at the engine's Vulkan directory,"
+            echo "so vulkaninfo resolves libvulkan through the SAME loader the"
+            echo "engine logs as 'Using included Vulkan loader'. A difference"
+            echo "from the system-loader dump is a candidate; sameness rules"
+            echo "the loader out, which is worth as much."
+            echo "--- engine Vulkan directory ---"
+          } >> "$DGF"
+          $PFX sh -c 'ls -l /home/ue4/UnrealEngine/Engine/Binaries/ThirdParty/Vulkan/Linux 2>&1 | head -20' \
+            >> "$DGF" 2>&1
+          {
+            echo "--- vulkaninfo through it ---"
+          } >> "$DGF"
+          $PFX sh -c 'LD_LIBRARY_PATH=/home/ue4/UnrealEngine/Engine/Binaries/ThirdParty/Vulkan/Linux:$LD_LIBRARY_PATH vulkaninfo 2>&1 | head -200' \
+            >> "$DGF" 2>&1
+          echo "criteria file bytes : $(wc -c < "$DGF" 2>/dev/null)"
+          # ------------------------------------------------------------------
           echo "cpu_devices=$CPU_DEV" >> "$GITHUB_OUTPUT"
           echo "gpu_devices=$GPU_DEV" >> "$GITHUB_OUTPUT"
           if [ "${CPU_DEV:-0}" = "0" ] && [ "${GPU_DEV:-0}" = "0" ]; then
@@ -1158,13 +1233,14 @@ jobs:
           # write into the workspace: it runs while the tree belongs to the
           # image's user. By this point the chown back has happened, which is
           # why the report file above lands without trouble.
-          for N in vp_ue_vulkan_sm5 lavapipe_vulkaninfo; do
+          for N in vp_ue_vulkan_sm5 lavapipe_vulkaninfo engine_device_criteria; do
             if [ -f "$RUNNER_TEMP/$N.txt" ]; then
               cp "$RUNNER_TEMP/$N.txt" "Reports/cloud_host/$N.txt"
             fi
           done
           for F in Reports/cloud_host/vp_ue_vulkan_sm5.txt \
-                   Reports/cloud_host/lavapipe_vulkaninfo.txt; do
+                   Reports/cloud_host/lavapipe_vulkaninfo.txt \
+                   Reports/cloud_host/engine_device_criteria.txt; do
             [ -f "$F" ] && git add -f "$F"
           done
           git commit -m "prebuilt engine: measured on the public runner, run ${RUN_ID}"
