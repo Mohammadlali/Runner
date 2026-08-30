@@ -42,6 +42,10 @@ on:
         description: 'compile the TehranBlindSpot module for Linux first'
         type: boolean
         default: true
+      image_from:
+        description: 'ghcr | mirror -- where the engine image comes from. mirror touches no registry'
+        required: false
+        default: 'ghcr'
       mirror:
         description: 'off | roundtrip | ghcrcheck | save | restore -- only save touches ghcr'
         required: false
@@ -158,6 +162,7 @@ jobs:
           TOK: ${{ secrets.TBS_PRIVATE_TOKEN }}
           TOK_ALT: ${{ secrets.TBS_PRIVATE_TOKEN_ALT }}
           ALT_USER: ${{ vars.TBS_ALT_USER }}
+          IMAGE_FROM: ${{ inputs.image_from }}
           IMG: ghcr.io/epicgames/unreal-engine:dev-slim-5.8.2
         run: |
           set +e
@@ -171,6 +176,49 @@ jobs:
           # TBS_PRIVATE_TOKEN carries write:packages, so the same secret this
           # workflow already uses can pull it. No new secret is introduced.
           BEGAN=$(date +%s)
+
+          # THE IMAGE CAN COME OFF OUR OWN RELEASE INSTEAD OF THE REGISTRY.
+          # Run 33326001703 restored it that way: 12/12 parts, every sha256
+          # matched, docker load rc 0, and the image read back PRESENT at
+          # 57.46 GB -- in 913 s against ~600 for a ghcr pull.
+          #
+          # It happens HERE, inside the pull step, on purpose. Every step
+          # below reads steps.pull.outputs.editor / .exec / .ueuid, so
+          # obtaining the image somewhere else in the job would have meant
+          # rewriting all of them and inventing a second set of outputs that
+          # could drift from these. Same step, same outputs, one code path
+          # after the image exists.
+          if [ "${IMAGE_FROM:-ghcr}" = "mirror" ]; then
+            echo "image source : MIRROR (no registry will be contacted)"
+            python3 "$GITHUB_WORKSPACE/work/Tools/engine_mirror.py" restore-stream \
+              --repo Mohammadlali/Claud-Cloud-Project \
+              --tag engine-mirror-dev-slim-5.8.2 \
+              --work "$RUNNER_TEMP/restore"
+            RC=$?
+            rm -rf "$RUNNER_TEMP/restore"
+            TRY=0
+            USED_CRED=mirror
+            echo "used_cred=$USED_CRED" >> "$GITHUB_OUTPUT"
+            echo "pull_tries=$TRY" >> "$GITHUB_OUTPUT"
+            SECS=$(( $(date +%s) - BEGAN ))
+            echo "restore rc=$RC in ${SECS}s"
+            if [ $RC -ne 0 ]; then
+              echo "rc=$RC" >> "$GITHUB_OUTPUT"
+              echo "::error::the mirror restore failed. NOT a registry problem --"
+              echo "::error::the digest above says which part or which stage."
+              exit 0
+            fi
+            # READ THE PROPERTY BACK before anything downstream trusts it.
+            if ! docker image inspect "$IMG" > /dev/null 2>&1; then
+              echo "rc=79" >> "$GITHUB_OUTPUT"
+              echo "::error::restore returned 0 and the image is NOT in docker."
+              echo "::error::A zero exit and an image being present are different"
+              echo "::error::claims, and only the second one matters here."
+              exit 0
+            fi
+            echo "image restored and verified present. Skipping ghcr entirely."
+          else
+          echo "image source : ghcr.io"
           echo "$TOK" | docker login ghcr.io -u Mohammadlali --password-stdin > /tmp/login.txt 2>&1
           if [ $? -ne 0 ]; then
             echo "rc=70" >> "$GITHUB_OUTPUT"
@@ -256,6 +304,7 @@ jobs:
           echo "pull_tries=$TRY" >> "$GITHUB_OUTPUT"
           SECS=$(( $(date +%s) - BEGAN ))
           echo "pull rc=$RC in ${SECS}s after $TRY attempt(s)"
+          fi
           if [ $RC -ne 0 ]; then
             echo "rc=$RC" >> "$GITHUB_OUTPUT"
             echo "the pull failed. Its own last lines:"
@@ -1173,6 +1222,7 @@ jobs:
           TOK: ${{ secrets.TBS_PRIVATE_TOKEN }}
           TOK_ALT: ${{ secrets.TBS_PRIVATE_TOKEN_ALT }}
           ALT_USER: ${{ vars.TBS_ALT_USER }}
+          IMAGE_FROM: ${{ inputs.image_from }}
           IMG: ghcr.io/epicgames/unreal-engine:dev-slim-5.8.2
         run: |
           set +e
