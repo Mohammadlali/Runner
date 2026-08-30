@@ -42,6 +42,10 @@ on:
         description: 'compile the TehranBlindSpot module for Linux first'
         type: boolean
         default: true
+      mirror:
+        description: 'off | roundtrip | save -- keep the image off ghcr. roundtrip costs no pull'
+        required: false
+        default: 'off'
       render:
         description: 'ask whether this container can render, then render Valiasr offscreen'
         type: boolean
@@ -145,7 +149,11 @@ jobs:
 
       - name: Pull the engine image from ghcr.io
         id: pull
-        if: ${{ steps.secret.outputs.ok == 'yes' && inputs.source == 'image' }}
+        # `mirror: roundtrip` must cost NO pull -- it exists to settle the
+        # store before anything bets 22.9 GB on it. Without this guard a
+        # roundtrip run would pull the image anyway and prove nothing
+        # about cheapness while spending the very quota at issue.
+        if: ${{ steps.secret.outputs.ok == 'yes' && inputs.source == 'image' && inputs.mirror != 'roundtrip' }}
         env:
           TOK: ${{ secrets.TBS_PRIVATE_TOKEN }}
           IMG: ghcr.io/epicgames/unreal-engine:dev-slim-5.8.2
@@ -945,7 +953,20 @@ jobs:
           # These four lines are what say which happened, and they cost
           # nothing -- the log is already on disk.
           echo "--- did the CPU device get past the gate? ---"
-          if grep -qE "None of the [0-9]+ devices meet all the criteria" \
+          # THE ENGINE MUST HAVE RUN BEFORE ITS SILENCE MEANS ANYTHING.
+          # Run 33307313953: ghcr refused all three pull attempts, $CMD was
+          # empty, timeout died with rc 127 in 0s -- and this block printed
+          # "GATE: message ABSENT", because a log that does not exist has no
+          # rejection in it. That is a failure to measure reported as a
+          # value, which is the one thing this project forbids outright.
+          # A run that produced no engine log now says so and stops.
+          if ! grep -qE "LogVulkanRHI|LogInit|LogCore" \
+                 "$LOG" /tmp/render.stdout 2>/dev/null; then
+            echo "GATE: NOT MEASURED -- the engine produced no log at all."
+            echo "      rc=$RC. Nothing here says anything about the device;"
+            echo "      the run died before the engine spoke. Check the pull"
+            echo "      and the editor path, not the gate."
+          elif grep -qE "None of the [0-9]+ devices meet all the criteria" \
                "$LOG" /tmp/render.stdout 2>/dev/null; then
             echo "GATE: STILL REJECTED -- the rejection message is still there."
             echo "      -AllowCPUDevices did NOT get the device through, and"
@@ -1049,6 +1070,48 @@ jobs:
             cp -r "$SAVED/Crashes/." "$RUNNER_TEMP/crashes/" 2>/dev/null
             echo "copied crashes dir: $(du -sh "$RUNNER_TEMP/crashes" 2>/dev/null | cut -f1)"
           fi
+
+      - name: Mirror roundtrip -- can Releases hold the image at all?
+        id: mirror_probe
+        if: ${{ inputs.mirror == 'roundtrip' }}
+        env:
+          TBS_PRIVATE_TOKEN: ${{ secrets.TBS_PRIVATE_TOKEN }}
+        run: |
+          set +e
+          # NO PULL. This settles whether the store works before anything
+          # bets 22.9 GB on it. The cloud container could not test it: its
+          # own token answers HTTP 403 "Creating, editing, or deleting
+          # releases is not permitted for this session type", which is a
+          # fact about THAT credential and not about this one.
+          python3 "$GITHUB_WORKSPACE/work/Tools/engine_mirror.py" roundtrip \
+            --repo Mohammadlali/Claud-Cloud-Project \
+            --tag engine-mirror-roundtrip
+          echo "rc=$?" >> "$GITHUB_OUTPUT"
+
+      - name: Mirror save -- put the pulled image on a Release
+        id: mirror_save
+        if: ${{ inputs.mirror == 'save' && steps.pull.outputs.rc == '0' }}
+        env:
+          TBS_PRIVATE_TOKEN: ${{ secrets.TBS_PRIVATE_TOKEN }}
+          IMG: ghcr.io/epicgames/unreal-engine:dev-slim-5.8.2
+        run: |
+          set +e
+          # Runs ONLY after a pull that succeeded, so building the mirror
+          # costs zero extra pulls -- the image is already on this disk.
+          M="$GITHUB_WORKSPACE/work/Tools/engine_mirror.py"
+          df -h / | tail -1
+          python3 "$M" save --image "$IMG" --work "$RUNNER_TEMP/mirror"
+          SRC=$?
+          echo "save_rc=$SRC" >> "$GITHUB_OUTPUT"
+          if [ "$SRC" -ne 0 ]; then
+            echo "save failed -- nothing uploaded. The digest above says why."
+            exit 0
+          fi
+          python3 "$M" upload --repo Mohammadlali/Claud-Cloud-Project \
+            --tag engine-mirror-dev-slim-5.8.2 \
+            --parts "$RUNNER_TEMP/mirror/parts"
+          echo "upload_rc=$?" >> "$GITHUB_OUTPUT"
+          rm -rf "$RUNNER_TEMP/mirror"
 
       - name: Hand the workspace back to the runner user
         if: ${{ always() }}
