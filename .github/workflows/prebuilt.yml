@@ -43,7 +43,7 @@ on:
         type: boolean
         default: true
       mirror:
-        description: 'off | roundtrip | save -- keep the image off ghcr. roundtrip costs no pull'
+        description: 'off | roundtrip | ghcrcheck | save -- ghcrcheck and roundtrip cost no pull'
         required: false
         default: 'off'
       render:
@@ -153,7 +153,7 @@ jobs:
         # store before anything bets 22.9 GB on it. Without this guard a
         # roundtrip run would pull the image anyway and prove nothing
         # about cheapness while spending the very quota at issue.
-        if: ${{ steps.secret.outputs.ok == 'yes' && inputs.source == 'image' && inputs.mirror != 'roundtrip' }}
+        if: ${{ steps.secret.outputs.ok == 'yes' && inputs.source == 'image' && inputs.mirror != 'roundtrip' && inputs.mirror != 'ghcrcheck' }}
         env:
           TOK: ${{ secrets.TBS_PRIVATE_TOKEN }}
           TOK_ALT: ${{ secrets.TBS_PRIVATE_TOKEN_ALT }}
@@ -1165,6 +1165,74 @@ jobs:
           echo "save_rc=$?" >> "$GITHUB_OUTPUT"
           df -h / | tail -1
           rm -rf "$RUNNER_TEMP/mirror"
+
+      - name: ghcrcheck -- is ghcr limiting REQUESTS or BYTES?
+        id: ghcrcheck
+        if: ${{ always() && inputs.mirror == 'ghcrcheck' }}
+        env:
+          TOK: ${{ secrets.TBS_PRIVATE_TOKEN }}
+          TOK_ALT: ${{ secrets.TBS_PRIVATE_TOKEN_ALT }}
+          ALT_USER: ${{ vars.TBS_ALT_USER }}
+          IMG: ghcr.io/epicgames/unreal-engine:dev-slim-5.8.2
+        run: |
+          set +e
+          # NO PULL. `docker manifest inspect` fetches a few KB of metadata
+          # and not one blob, so this costs nothing whatever the answer is.
+          #
+          # WHAT IT SEPARATES, and nobody has separated it yet:
+          #   manifest OK  + pull refused -> ghcr is limiting BYTES/blobs.
+          #                  Then pulling less, or from another network, is
+          #                  the lever, and a self-hosted runner is the
+          #                  prime candidate.
+          #   manifest ALSO refused       -> the block is at the API level,
+          #                  and no amount of pulling less will help.
+          #
+          # Run 33316967154 showed BOTH accounts throttled minutes apart, the
+          # second mid-download, so the limit is not keyed on the account.
+          # This says which shared thing it is keyed on -- or at least rules
+          # one of them out.
+          probe () {
+            NAME="$1"; USER="$2"; TOKEN="$3"
+            echo "--- $NAME ---"
+            if [ -z "$TOKEN" ]; then
+              echo "$NAME: NOT MEASURED -- no token set for it."
+              return
+            fi
+            echo "$TOKEN" | docker login ghcr.io -u "$USER" --password-stdin \
+              > /tmp/li_$NAME.txt 2>&1
+            LRC=$?
+            echo "$NAME login rc : $LRC"
+            [ $LRC -ne 0 ] && {
+              sed -e 's/[A-Za-z0-9_-]\{20,\}/<redacted>/g' /tmp/li_$NAME.txt | head -3
+              return
+            }
+            BEGAN=$(date +%s)
+            docker manifest inspect "$IMG" > /tmp/mf_$NAME.txt 2>&1
+            MRC=$?
+            echo "$NAME manifest rc : $MRC in $(( $(date +%s) - BEGAN ))s"
+            if [ $MRC -eq 0 ]; then
+              echo "$NAME manifest bytes : $(wc -c < /tmp/mf_$NAME.txt)"
+              echo "$NAME VERDICT : METADATA OK -- not blocked at the API level"
+            else
+              head -3 /tmp/mf_$NAME.txt
+              if grep -qi toomanyrequests /tmp/mf_$NAME.txt; then
+                echo "$NAME VERDICT : THROTTLED EVEN FOR METADATA"
+              else
+                echo "$NAME VERDICT : failed for a reason that is NOT the quota"
+              fi
+            fi
+          }
+          probe primary   "Mohammadlali"            "$TOK"
+          probe alternate "${ALT_USER:-Mohammadlali}" "$TOK_ALT"
+          echo "--- any rate-limit headers, WITH a real credential this time ---"
+          # Measured anonymously from the cloud container: ghcr returns none.
+          # With auth it may differ, and that has never been checked.
+          B=$(printf '%s' "Mohammadlali:$TOK" | base64 -w0)
+          curl -s -D - -o /dev/null \
+            -H "Authorization: Basic $B" \
+            "https://ghcr.io/token?service=ghcr.io&scope=repository:epicgames/unreal-engine:pull" \
+            | grep -iE "^HTTP|ratelimit|retry-after" | head -6
+          echo "(no header line above means ghcr states no quota even to an authenticated caller)"
 
       - name: Hand the workspace back to the runner user
         if: ${{ always() }}
