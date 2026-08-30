@@ -1073,7 +1073,13 @@ jobs:
 
       - name: Mirror roundtrip -- can Releases hold the image at all?
         id: mirror_probe
-        if: ${{ inputs.mirror == 'roundtrip' }}
+        # `always()` BECAUSE THIS STEP DOES NOT NEED THE ENGINE.
+        # Run 33311767871: the input arrived (the pull guard fired, so
+        # mirror WAS 'roundtrip'), but `boot` failed for want of an
+        # image and Actions skips every later step without always().
+        # The roundtrip tests the STORE, not the engine, and must run
+        # whatever the engine did.
+        if: ${{ always() && inputs.mirror == 'roundtrip' }}
         env:
           TBS_PRIVATE_TOKEN: ${{ secrets.TBS_PRIVATE_TOKEN }}
         run: |
@@ -1090,7 +1096,7 @@ jobs:
 
       - name: Mirror save -- put the pulled image on a Release
         id: mirror_save
-        if: ${{ inputs.mirror == 'save' && steps.pull.outputs.rc == '0' }}
+        if: ${{ always() && inputs.mirror == 'save' && steps.pull.outputs.rc == '0' }}
         env:
           TBS_PRIVATE_TOKEN: ${{ secrets.TBS_PRIVATE_TOKEN }}
           IMG: ghcr.io/epicgames/unreal-engine:dev-slim-5.8.2
