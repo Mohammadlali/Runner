@@ -47,7 +47,7 @@ on:
         required: false
         default: 'ghcr'
       mirror:
-        description: 'off | roundtrip | ghcrcheck | save | restore -- only save touches ghcr'
+        description: 'off | roundtrip | ghcrcheck | save | restore | crashmatrix -- only save touches ghcr'
         required: false
         default: 'off'
       render:
@@ -1325,6 +1325,69 @@ jobs:
             --format 'PRESENT id={{.Id}} size={{.Size}}' 2>&1 | head -2
           echo "image_present_rc=$?" >> "$GITHUB_OUTPUT"
           docker images --format '{{.Repository}}:{{.Tag}} {{.Size}}' | head -5
+
+      - name: crashmatrix -- which of the three differences causes the SIGSEGV?
+        id: crashmatrix
+        if: ${{ always() && inputs.mirror == 'crashmatrix' && steps.pull.outputs.rc == '0' }}
+        env:
+          CMD: ${{ steps.pull.outputs.editor }}
+          PFX: ${{ steps.pull.outputs.exec }}
+        run: |
+          set +e
+          # THE CONFOUND THIS EXISTS TO REMOVE. The record said the crash
+          # "correlates with having a real RHI", on the grounds that the boot
+          # step succeeds and the render step does not. But those two differ
+          # in THREE ways at once -- -NullRHI, the python script, and
+          # -RenderOffScreen -- so that reading was a guess wearing a
+          # measurement's clothes.
+          #
+          # One restore, several questions: the image is already here and the
+          # expensive part is done, so each variant costs about two minutes.
+          PROJ="$GITHUB_WORKSPACE/work/TehranBlindSpot.uproject"
+          T="$GITHUB_WORKSPACE/work/Tools"
+          run_variant () {
+            NAME="$1"; shift
+            LOG="$GITHUB_WORKSPACE/v_$NAME.log"
+            rm -f "$LOG"
+            BEGAN=$(date +%s)
+            timeout 600 $PFX "$CMD" "$PROJ" "$@" \
+              -unattended -nopause -nosplash -stdout -abslog="$LOG" \
+              > "/tmp/v_$NAME.out" 2>&1
+            RC=$?
+            SECS=$(( $(date +%s) - BEGAN ))
+            LAST=$(grep -a "InternalLoadLibrary\|LogInit: Display: === \|Fatal" "$LOG" 2>/dev/null \
+                   | tail -1 | sed 's/.*InternalLoadLibrary: //' | cut -c1-60)
+            SIG=""
+            [ "$RC" -ge 128 ] && SIG=" (signal $(( RC - 128 )))"
+            PNG=$(find "$GITHUB_WORKSPACE/work/Reports" -name '*.png' -newer "$LOG" 2>/dev/null | wc -l)
+            printf '%-26s rc=%-4s%-13s %4ss  png=%s  last=%s\n' \
+              "$NAME" "$RC" "$SIG" "$SECS" "$PNG" "${LAST:-<no module line>}"
+          }
+
+          echo "=== one variable at a time, from the render command outwards ==="
+          # A. the known crash, reproduced here so the matrix carries its own control
+          run_variant "A_district_render" \
+            -ExecutePythonScript="$T/probe_district.py" \
+            -RenderOffScreen -ResX=1280 -ResY=720 -AllowCPUDevices
+          # B. same, minus the real RHI. If B survives, the RHI is implicated.
+          run_variant "B_district_nullrhi" \
+            -ExecutePythonScript="$T/probe_district.py" \
+            -RenderOffScreen -ResX=1280 -ResY=720 -AllowCPUDevices -NullRHI
+          # C. same as A but the boot script. If C crashes too, the script is
+          #    not the cause and the difference is the rendering setup.
+          run_variant "C_boot_render" \
+            -ExecutePythonScript="$T/probe_boot.py" \
+            -RenderOffScreen -ResX=1280 -ResY=720 -AllowCPUDevices
+          # D. no script at all. If D crashes, no python of ours is involved
+          #    and the engine dies on its own render startup.
+          run_variant "D_noscript_render" \
+            -RenderOffScreen -ResX=1280 -ResY=720 -AllowCPUDevices
+
+          echo ""
+          echo "HOW TO READ THIS: rc 139 is SIGSEGV. A variant that does NOT"
+          echo "crash names the difference that matters; a variant that does"
+          echo "rules its difference OUT. If all four crash, the cause is in"
+          echo "none of these three and the search moves elsewhere."
 
       - name: Hand the workspace back to the runner user
         if: ${{ always() }}
