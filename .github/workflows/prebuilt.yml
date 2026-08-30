@@ -43,7 +43,7 @@ on:
         type: boolean
         default: true
       mirror:
-        description: 'off | roundtrip | ghcrcheck | save -- ghcrcheck and roundtrip cost no pull'
+        description: 'off | roundtrip | ghcrcheck | save | restore -- only save touches ghcr'
         required: false
         default: 'off'
       render:
@@ -153,7 +153,7 @@ jobs:
         # store before anything bets 22.9 GB on it. Without this guard a
         # roundtrip run would pull the image anyway and prove nothing
         # about cheapness while spending the very quota at issue.
-        if: ${{ steps.secret.outputs.ok == 'yes' && inputs.source == 'image' && inputs.mirror != 'roundtrip' && inputs.mirror != 'ghcrcheck' }}
+        if: ${{ steps.secret.outputs.ok == 'yes' && inputs.source == 'image' && inputs.mirror != 'roundtrip' && inputs.mirror != 'ghcrcheck' && inputs.mirror != 'restore' }}
         env:
           TOK: ${{ secrets.TBS_PRIVATE_TOKEN }}
           TOK_ALT: ${{ secrets.TBS_PRIVATE_TOKEN_ALT }}
@@ -1233,6 +1233,41 @@ jobs:
             "https://ghcr.io/token?service=ghcr.io&scope=repository:epicgames/unreal-engine:pull" \
             | grep -iE "^HTTP|ratelimit|retry-after" | head -6
           echo "(no header line above means ghcr states no quota even to an authenticated caller)"
+
+      - name: Mirror restore -- read the image back off the Release
+        id: mirror_restore
+        if: ${{ always() && inputs.mirror == 'restore' }}
+        env:
+          TBS_PRIVATE_TOKEN: ${{ secrets.TBS_PRIVATE_TOKEN }}
+        run: |
+          set +e
+          # NO GHCR. This reads the 12 parts off the Release, verifies a
+          # sha256 for each and one for the whole stream, and pipes them
+          # straight into `docker load`. The archive never lands on disk.
+          #
+          # An image that is STORED is not an image that is RESTORED. Run
+          # 33324238605 put 22.33 GB on the release; until this step passes,
+          # that is a belief and ghcr is still the only proven source.
+          M="$GITHUB_WORKSPACE/work/Tools/engine_mirror.py"
+          df -h / | tail -1
+          BEGAN=$(date +%s)
+          python3 "$M" restore-stream \
+            --repo Mohammadlali/Claud-Cloud-Project \
+            --tag engine-mirror-dev-slim-5.8.2 \
+            --work "$RUNNER_TEMP/restore"
+          RRC=$?
+          echo "restore_rc=$RRC" >> "$GITHUB_OUTPUT"
+          echo "restore took $(( $(date +%s) - BEGAN ))s"
+          df -h / | tail -1
+          rm -rf "$RUNNER_TEMP/restore"
+          # READ THE PROPERTY BACK. A zero exit and an image actually being
+          # present are different claims, and this project has paid for
+          # trusting the first.
+          echo "--- is the image really in the local docker now? ---"
+          docker image inspect ghcr.io/epicgames/unreal-engine:dev-slim-5.8.2 \
+            --format 'PRESENT id={{.Id}} size={{.Size}}' 2>&1 | head -2
+          echo "image_present_rc=$?" >> "$GITHUB_OUTPUT"
+          docker images --format '{{.Repository}}:{{.Tag}} {{.Size}}' | head -5
 
       - name: Hand the workspace back to the runner user
         if: ${{ always() }}
