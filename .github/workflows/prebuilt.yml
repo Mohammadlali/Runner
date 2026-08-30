@@ -1362,6 +1362,19 @@ jobs:
             PNG=$(find "$GITHUB_WORKSPACE/work/Reports" -name '*.png' -newer "$LOG" 2>/dev/null | wc -l)
             printf '%-26s rc=%-4s%-13s %4ss  png=%s  last=%s\n' \
               "$NAME" "$RC" "$SIG" "$SECS" "$PNG" "${LAST:-<no module line>}"
+            # THE FATAL LINE IN FULL. The first matrix run truncated it at 60
+            # characters and threw away the one thing worth having: UE writes
+            # `Fatal error: [File:<path>] [Line: N]` and the path and line
+            # are the whole answer. Never summarise the line that names the
+            # bug.
+            echo "  -- fatal context for $NAME --"
+            grep -a -m1 -A6 "Fatal error" "$LOG" 2>/dev/null | cut -c1-200 \
+              | sed 's/^/    /'
+            grep -a -m1 -B2 -A8 "Assertion failed" "$LOG" 2>/dev/null | cut -c1-200 \
+              | sed 's/^/    /'
+            # keep the log for delivery; the runner is thrown away, this is not
+            mkdir -p "$RUNNER_TEMP/variants"
+            cp "$LOG" "$RUNNER_TEMP/variants/$NAME.log" 2>/dev/null
           }
 
           echo "=== one variable at a time, from the render command outwards ==="
@@ -1689,6 +1702,16 @@ jobs:
             cp "$RUNNER_TEMP/crash_report.txt" \
                "Reports/cloud_host/crash_report_${RUN_ID}.txt"
             git add -f "Reports/cloud_host/crash_report_${RUN_ID}.txt"
+          fi
+          # The crashmatrix variant logs, for the same reason as the crash
+          # artefacts: the runner is discarded and these are the evidence.
+          if [ -d "$RUNNER_TEMP/variants" ] && [ -n "$(ls -A "$RUNNER_TEMP/variants" 2>/dev/null)" ]; then
+            mkdir -p "Reports/cloud_host/variants_${RUN_ID}"
+            for F in "$RUNNER_TEMP"/variants/*.log; do
+              [ -f "$F" ] || continue
+              tail -400 "$F" > "Reports/cloud_host/variants_${RUN_ID}/$(basename "$F")"
+            done
+            git add -f "Reports/cloud_host/variants_${RUN_ID}"
           fi
           if [ -d "$RUNNER_TEMP/crashes" ] && [ -n "$(ls -A "$RUNNER_TEMP/crashes" 2>/dev/null)" ]; then
             mkdir -p "Reports/cloud_host/crashes_${RUN_ID}"
