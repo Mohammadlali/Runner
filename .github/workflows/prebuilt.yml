@@ -970,6 +970,86 @@ jobs:
           echo "--- last 60 lines of the editor's OWN log ---"
           tail -60 "$LOG" 2>/dev/null
 
+      - name: Symbolise the crash the render died on
+        id: crash
+        if: ${{ always() && steps.render.outputs.rc != '0' && steps.render.outputs.rc != '' }}
+        env:
+          PFX: ${{ steps.pull.outputs.exec }}
+        run: |
+          set +e
+          # Run 33305367382 got the device accepted and then died rc 139
+          # (SIGSEGV) with ONE unsymbolised frame:
+          #     libc.so.6!UnknownFunction(0x4251f)
+          # which names nothing. The engine writes a crashinfo directory
+          # containing its own context and log, and neither has ever been
+          # brought home. This step exists to make the next claim about WHY
+          # it crashes rest on a named function instead of on the last line
+          # that happened to be logged.
+          #
+          # ALWAYS + rc != '' : an empty rc means the render step never ran,
+          # and NOT MEASURED is a different answer from a crash. A skipped
+          # render must not produce a crash report saying nothing was found.
+          OUT="$RUNNER_TEMP/crash_report.txt"
+          SAVED="$GITHUB_WORKSPACE/work/Saved"
+          {
+            echo "when        : $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "render rc   : ${{ steps.render.outputs.rc }}"
+            echo ""
+
+            echo "== 1. WHAT CRASH ARTEFACTS EXIST =="
+            find "$SAVED" -maxdepth 3 \( -name 'crashinfo*' -o -name '*.dmp' \
+              -o -name 'CrashContext*' -o -name 'core*' \) 2>/dev/null | head -20
+            CI=$(find "$SAVED/Crashes" -maxdepth 1 -type d -name 'crashinfo*' 2>/dev/null | head -1)
+            echo "crashinfo dir: ${CI:-<none>}"
+            echo ""
+
+            if [ -n "$CI" ]; then
+              echo "== 2. THE CRASH CONTEXT, as the engine recorded it =="
+              # CallStack and Modules are the two elements worth having; the
+              # xml is large and most of it is machine description.
+              for F in "$CI"/CrashContext.runtime-xml "$CI"/*.log; do
+                [ -f "$F" ] || continue
+                echo "-- $F"
+                grep -aE "CallStack|SourceContext|ErrorMessage|CrashType|Signal" \
+                  "$F" 2>/dev/null | head -40
+              done
+              echo ""
+            else
+              echo "== 2. NOT MEASURED: no crashinfo directory =="
+              echo "The engine did not leave one, or it is not under $SAVED."
+              echo "This is a failure to find it, NOT evidence that the crash"
+              echo "produced nothing."
+              echo ""
+            fi
+
+            echo "== 3. IS THERE A SYMBOLISER IN THE IMAGE AT ALL? =="
+            # Named individually so a missing one is a stated absence rather
+            # than a silent skip -- 'gdb not installed' and 'gdb found no
+            # frames' are different answers and must not read alike.
+            for T in gdb addr2line eu-addr2line nm objdump; do
+              P=$($PFX sh -c "command -v $T" 2>/dev/null)
+              echo "  $T : ${P:-<absent>}"
+            done
+            echo ""
+
+            echo "== 4. THE ENGINE'S OWN CALLSTACK LINES =="
+            grep -aE "^0x[0-9a-f]+|UnknownFunction|!.*\(0x" \
+              "$GITHUB_WORKSPACE/render.log" /tmp/render.stdout 2>/dev/null | head -30
+            echo ""
+
+            echo "VERDICT: CRASH ARTEFACTS COLLECTED. Whether they name a"
+            echo "         function is what sections 2 and 4 say. A frame"
+            echo "         count is not a diagnosis."
+          } > "$OUT" 2>&1
+          cat "$OUT"
+          # The whole crashinfo directory goes home too -- it is small, and
+          # the alternative is another 22.9 GB pull to ask it one more thing.
+          if [ -n "$SAVED" ] && [ -d "$SAVED/Crashes" ]; then
+            mkdir -p "$RUNNER_TEMP/crashes"
+            cp -r "$SAVED/Crashes/." "$RUNNER_TEMP/crashes/" 2>/dev/null
+            echo "copied crashes dir: $(du -sh "$RUNNER_TEMP/crashes" 2>/dev/null | cut -f1)"
+          fi
+
       - name: Hand the workspace back to the runner user
         if: ${{ always() }}
         run: |
@@ -1257,6 +1337,31 @@ jobs:
           # OUT_DIR at Tools/probe_district.py:35, read rather than assumed.
           if [ -d Reports/district ] && [ -n "$(ls -A Reports/district 2>/dev/null)" ]; then
             git add -f Reports/district
+          fi
+          # THE CRASH ARTEFACTS. Run 33305367382 died rc 139 with one
+          # unsymbolised frame, and the engine's own crashinfo directory
+          # was never brought home -- so the next question about WHY would
+          # have cost another 22.9 GB pull to ask. These are small.
+          # Copied from $RUNNER_TEMP because the crash step runs BEFORE the
+          # chown back and cannot write into the workspace (the Permission
+          # denied that cost run 33200211918 two dumps).
+          if [ -f "$RUNNER_TEMP/crash_report.txt" ]; then
+            mkdir -p Reports/cloud_host
+            cp "$RUNNER_TEMP/crash_report.txt" \
+               "Reports/cloud_host/crash_report_${RUN_ID}.txt"
+            git add -f "Reports/cloud_host/crash_report_${RUN_ID}.txt"
+          fi
+          if [ -d "$RUNNER_TEMP/crashes" ] && [ -n "$(ls -A "$RUNNER_TEMP/crashes" 2>/dev/null)" ]; then
+            mkdir -p "Reports/cloud_host/crashes_${RUN_ID}"
+            # Text only. A minidump is a binary this repo has no symboliser
+            # for, and committing megabytes nobody can read is not delivery.
+            find "$RUNNER_TEMP/crashes" -type f \
+              \( -name '*.log' -o -name '*.xml' -o -name '*.runtime-xml' \
+                 -o -name '*.txt' -o -name '*.ini' \) \
+              -size -2M -exec cp {} "Reports/cloud_host/crashes_${RUN_ID}/" \; 2>/dev/null
+            if [ -n "$(ls -A "Reports/cloud_host/crashes_${RUN_ID}" 2>/dev/null)" ]; then
+              git add -f "Reports/cloud_host/crashes_${RUN_ID}"
+            fi
           fi
           # The profile Epic demands and the device lavapipe offers. These are
           # what turn "none of the devices meet all the criteria" into a named
