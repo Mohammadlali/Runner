@@ -190,9 +190,16 @@ jobs:
           # after the image exists.
           if [ "${IMAGE_FROM:-ghcr}" = "mirror" ]; then
             echo "image source : MIRROR (no registry will be contacted)"
+            # --token-env TOK, because THIS step names the secret TOK.
+            # Run 33327227345 restored in 0 s with
+            #   {"why": "TBS_PRIVATE_TOKEN is empty -- NOT MEASURED"}
+            # -- the tool's default env name is not the one in scope here.
+            # It reported a failure to measure rather than inventing a
+            # cause, which is the only reason this took one run to find.
             python3 "$GITHUB_WORKSPACE/work/Tools/engine_mirror.py" restore-stream \
               --repo Mohammadlali/Claud-Cloud-Project \
               --tag engine-mirror-dev-slim-5.8.2 \
+              --token-env TOK \
               --work "$RUNNER_TEMP/restore"
             RC=$?
             rm -rf "$RUNNER_TEMP/restore"
