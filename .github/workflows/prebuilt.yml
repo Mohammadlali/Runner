@@ -1377,6 +1377,10 @@ jobs:
             cp "$LOG" "$RUNNER_TEMP/variants/$NAME.log" 2>/dev/null
           }
 
+          # WHERE THE ICD ACTUALLY IS, asked rather than assumed.
+          ICD=$($PFX sh -c 'ls /usr/share/vulkan/icd.d/*.json 2>/dev/null | tr "\n" ":"' | sed 's/:$//')
+          echo "ICD files the container has : ${ICD:-<none found>}"
+
           echo "=== one variable at a time, from the render command outwards ==="
           # A. the known crash, reproduced here so the matrix carries its own control
           run_variant "A_district_render" \
@@ -1395,6 +1399,36 @@ jobs:
           #    and the engine dies on its own render startup.
           run_variant "D_noscript_render" \
             -RenderOffScreen -ResX=1280 -ResY=720 -AllowCPUDevices
+
+          # E. THE FIX THIS RUN EXISTS TO TEST. Runs A/C/D died with
+          #      vpCreateInstance ... VK_ERROR_INCOMPATIBLE_DRIVER
+          #    while the log said "Installed Vulkan Loader instance version
+          #    1.3.204. Using included Vulkan loader." The engine uses its
+          #    BUNDLED loader; every measurement that ever FOUND lavapipe --
+          #    vulkaninfo, the vk step's "software devices 1" -- went through
+          #    the SYSTEM loader at 1.3.255. INCOMPATIBLE_DRIVER at instance
+          #    creation is a loader that found no usable ICD, so point it at
+          #    the one the container actually has.
+          if [ -n "$ICD" ]; then
+            PFX="$PFX -e VK_ICD_FILENAMES=$ICD -e VK_DRIVER_FILES=$ICD" \
+            run_variant "E_icd_pointed" \
+              -RenderOffScreen -ResX=1280 -ResY=720 -AllowCPUDevices
+          else
+            echo "E_icd_pointed            NOT MEASURED -- no ICD json in the container"
+          fi
+
+          # F. same, with the loader saying what it looked at and rejected.
+          #    Its own account beats any inference from a failure code.
+          if [ -n "$ICD" ]; then
+            PFX="$PFX -e VK_ICD_FILENAMES=$ICD -e VK_LOADER_DEBUG=error,warn,info" \
+            run_variant "F_loader_debug" \
+              -RenderOffScreen -ResX=1280 -ResY=720 -AllowCPUDevices
+            echo "  -- what the loader said it was doing --"
+            grep -aiE "icd|driver|manifest|LOADER" "$GITHUB_WORKSPACE/v_F_loader_debug.log" \
+              2>/dev/null | head -15 | cut -c1-180 | sed 's/^/    /'
+            grep -aiE "icd|driver|manifest|LOADER" /tmp/v_F_loader_debug.out \
+              2>/dev/null | head -15 | cut -c1-180 | sed 's/^/    /'
+          fi
 
           echo ""
           echo "HOW TO READ THIS: rc 139 is SIGSEGV. A variant that does NOT"
