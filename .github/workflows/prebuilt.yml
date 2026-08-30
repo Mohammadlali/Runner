@@ -156,6 +156,8 @@ jobs:
         if: ${{ steps.secret.outputs.ok == 'yes' && inputs.source == 'image' && inputs.mirror != 'roundtrip' }}
         env:
           TOK: ${{ secrets.TBS_PRIVATE_TOKEN }}
+          TOK_ALT: ${{ secrets.TBS_PRIVATE_TOKEN_ALT }}
+          ALT_USER: ${{ vars.TBS_ALT_USER }}
           IMG: ghcr.io/epicgames/unreal-engine:dev-slim-5.8.2
         run: |
           set +e
@@ -209,6 +211,48 @@ jobs:
               sleep "$WAIT"
             fi
           done
+          # THE OWNER'S SECOND ACCOUNT, ON HIS EXPRESS INSTRUCTION (2026-08-30).
+          #
+          # It is tried ONLY after the primary has exhausted all three attempts
+          # on TOOMANYREQUESTS, and only if TBS_PRIVATE_TOKEN_ALT is set. It is
+          # never the default and never silent: the report says which
+          # credential pulled the image, so no later reading can mistake a
+          # fallback pull for an ordinary one.
+          #
+          # THE PRECONDITION IS ACCESS, NOT QUOTA. ghcr serves
+          # epicgames/unreal-engine to EpicGames ORG MEMBERS. engine_auth.txt
+          # measured `EpicGames: 200 state=active` for login Mohammadlali and
+          # for no one else, so an account without its own membership is
+          # DENIED rather than throttled -- a different failure, and the
+          # report distinguishes them instead of calling both "pull failed".
+          USED_CRED=primary
+          if [ $RC -ne 0 ] && [ -n "${TOK_ALT:-}" ] \
+             && grep -qi "toomanyrequests" /tmp/pull.txt 2>/dev/null; then
+            echo "primary exhausted on TOOMANYREQUESTS; trying the alternate account."
+            echo "$TOK_ALT" | docker login ghcr.io -u "${ALT_USER:-Mohammadlali}" \
+              --password-stdin > /tmp/login_alt.txt 2>&1
+            if [ $? -ne 0 ]; then
+              echo "alternate login REFUSED -- a credential problem, not a queue:"
+              sed -e 's/[A-Za-z0-9_-]\{20,\}/<redacted>/g' /tmp/login_alt.txt | head -5
+            else
+              docker pull "$IMG" > /tmp/pull_alt.txt 2>&1
+              RC=$?
+              if [ $RC -eq 0 ]; then
+                USED_CRED=alternate
+                echo "pulled with the ALTERNATE account."
+              else
+                USED_CRED="alternate-failed"
+                echo "alternate pull failed too (rc $RC). Its last lines:"
+                tail -3 /tmp/pull_alt.txt
+                if grep -qiE "denied|unauthorized|forbidden" /tmp/pull_alt.txt; then
+                  echo "DENIED, not throttled: this account is not an EpicGames"
+                  echo "org member, so no amount of waiting will help it."
+                fi
+              fi
+            fi
+          fi
+          echo "used_cred=$USED_CRED" >> "$GITHUB_OUTPUT"
+          echo "credential used : $USED_CRED"
           echo "pull_tries=$TRY" >> "$GITHUB_OUTPUT"
           SECS=$(( $(date +%s) - BEGAN ))
           echo "pull rc=$RC in ${SECS}s after $TRY attempt(s)"
