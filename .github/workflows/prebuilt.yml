@@ -1401,7 +1401,11 @@ jobs:
           # not.
           PFX_ROOT=$(echo "$PFX" | sed 's/docker exec/docker exec -u 0/')
           echo "install prefix : $PFX_ROOT"
-          $PFX_ROOT sh -c 'apt-get update -qq && apt-get install -y -qq mesa-vulkan-drivers vulkan-tools' \
+          # gdb TOO. The image has addr2line, nm and objdump and no gdb, and
+          # every look at this crash has produced one unsymbolised libc frame
+          # and nothing else -- the engine's own minidump reported "0 loaded
+          # modules". Nothing on hand walks that stack. apt has one.
+          $PFX_ROOT sh -c 'apt-get update -qq && apt-get install -y -qq mesa-vulkan-drivers vulkan-tools gdb' \
             > /tmp/vkinstall.txt 2>&1
           echo "driver install rc : $?"
           tail -3 /tmp/vkinstall.txt
@@ -1469,6 +1473,37 @@ jobs:
               2>/dev/null | head -15 | cut -c1-180 | sed 's/^/    /'
             grep -aiE "icd|driver|manifest|LOADER" /tmp/v_F_loader_debug.out \
               2>/dev/null | head -15 | cut -c1-180 | sed 's/^/    /'
+          fi
+
+          # G. UNDER gdb, FOR A STACK WITH NAMES IN IT.
+          #
+          # The RHI initialises fine -- run 33334957070 shows the loader
+          # finding lavapipe, the device enumerated at API=1.3.255
+          # VendorId=0x10005, and the denylist check passing. The crash comes
+          # LATER, right after `InternalLoadLibrary: 'ViewportInteraction'`,
+          # and only when a real RHI exists (B survives under -NullRHI).
+          # That is a correlation and it has gone as far as it can without a
+          # stack.
+          if $PFX sh -c 'command -v gdb' > /dev/null 2>&1; then
+            echo "=== G: the same crash, under gdb ==="
+            BEGAN=$(date +%s)
+            timeout 900 $PFX gdb -batch -q \
+              -ex 'set pagination off' \
+              -ex 'run' \
+              -ex 'bt 40' \
+              -ex 'info sharedlibrary' \
+              --args "$CMD" "$PROJ" \
+              -RenderOffScreen -ResX=1280 -ResY=720 -AllowCPUDevices \
+              -unattended -nopause -nosplash -stdout \
+              > /tmp/gdb.out 2>&1
+            echo "gdb rc=$? in $(( $(date +%s) - BEGAN ))s"
+            echo "--- the backtrace, which is the whole point ---"
+            grep -aE "^#[0-9]+|SIGSEGV|Program received|Thread .* received" /tmp/gdb.out \
+              | head -45 | cut -c1-190
+            mkdir -p "$RUNNER_TEMP/variants"
+            tail -300 /tmp/gdb.out > "$RUNNER_TEMP/variants/G_gdb.log"
+          else
+            echo "G_gdb                    NOT MEASURED -- gdb is not in the container"
           fi
 
           echo ""
