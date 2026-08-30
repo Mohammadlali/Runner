@@ -1377,9 +1377,35 @@ jobs:
             cp "$LOG" "$RUNNER_TEMP/variants/$NAME.log" 2>/dev/null
           }
 
+          # INSTALL THE DRIVER HERE, NOT SOMEWHERE ELSE.
+          #
+          # Run 33331062254 measured `ICD files the container has : <none
+          # found>` and I had already written a block claiming the render
+          # crash was VK_ERROR_INCOMPATIBLE_DRIVER because of it. It was
+          # not: mesa-vulkan-drivers is installed by the vk step, that step
+          # is gated on inputs.render, and this matrix runs with
+          # render:false -- so the whole matrix had no Vulkan driver and was
+          # answering a question nobody asked. The timings said so (17 s
+          # here against 113 s for the real crash) and I recorded that as
+          # "unexplained" rather than chasing it.
+          #
+          # A step that needs an environment must MAKE that environment, not
+          # inherit it from an input that can silently change underneath.
+          echo "installing the software Vulkan driver for this step's own use"
+          $PFX sh -c 'apt-get update -qq && apt-get install -y -qq mesa-vulkan-drivers vulkan-tools' \
+            > /tmp/vkinstall.txt 2>&1
+          echo "driver install rc : $?"
+          tail -2 /tmp/vkinstall.txt
+
           # WHERE THE ICD ACTUALLY IS, asked rather than assumed.
           ICD=$($PFX sh -c 'ls /usr/share/vulkan/icd.d/*.json 2>/dev/null | tr "\n" ":"' | sed 's/:$//')
           echo "ICD files the container has : ${ICD:-<none found>}"
+          if [ -z "$ICD" ]; then
+            echo "::error::NO ICD AFTER INSTALLING ONE. Every variant below is"
+            echo "::error::running without a Vulkan driver and says nothing"
+            echo "::error::about the crash under investigation. Do not read"
+            echo "::error::INCOMPATIBLE_DRIVER from this run as a finding."
+          fi
 
           echo "=== one variable at a time, from the render command outwards ==="
           # A. the known crash, reproduced here so the matrix carries its own control
