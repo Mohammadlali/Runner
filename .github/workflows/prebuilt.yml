@@ -871,19 +871,33 @@ jobs:
           PROJ="$GITHUB_WORKSPACE/work/TehranBlindSpot.uproject"
           LOG="$GITHUB_WORKSPACE/render.log"
           rm -f "$LOG" /tmp/render.stdout /tmp/render.digests
-          # -LogCmds="LogVulkanRHI Verbose" BECAUSE THE ENGINE REJECTED THE
-          # DEVICE AND WOULD NOT SAY WHY. Run 33151148400: lavapipe was
-          # installed, the loader enumerated it (cpu devices=1), and Unreal
-          # answered
+          # -AllowCPUDevices IS THE FIX, AND IT IS ONE FLAG.
           #
-          #   LogVulkanRHI: Warning: None of the 1 devices meet all the criteria!
-          #   LogRHI: Display: Skipping SF_VULKAN_SM5...
+          # Run 33304835669 read the engine source (no image, no ghcr):
+          # Engine/Source/Runtime/VulkanRHI/Private/VulkanRHI.cpp
           #
-          # and exited. So the engine SAW the software device and refused it
-          # for failing the SM5 criteria -- and the whole job log names no
-          # feature, extension or limit. Verbose is what makes the device
-          # selection print its reasons. This is a DIAGNOSTIC, not a fix: it
-          # buys the name of the missing criterion and nothing else.
+          #   257  const bool bAllowCPUDevices =
+          #          FParse::Param(FCommandLine::Get(), TEXT("AllowCPUDevices"))
+          #       || FParse::Param(FCommandLine::Get(), TEXT("AllowSoftwareRendering"));
+          #   260  if (!bAllowCPUDevices && (... .deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU))
+          #   268  UE_LOGF(..., "None of the %u devices meet all the criteria!", ...)
+          #
+          # The device is DISCARDED FOR BEING A CPU eight lines before that
+          # message, so the message is not about the SM5 criteria at all.
+          # That is why run 33204569737 measured all three clauses of
+          # VP_UE_Vulkan_SM5 as satisfied and the engine refused anyway.
+          #
+          # ~~Verbose is what makes the device selection print its reasons.~~
+          # MEASURED FALSE, run 33200211918: lines 1145-1148 of that log show
+          # NOTHING between "Starting Vulkan Profile check" and the warning.
+          # The engine names no clause at any verbosity -- because there was
+          # no failing clause. Kept only so its absence stays visible in the
+          # next log; it is not buying the diagnosis it was added for.
+          #
+          # WHAT THIS FLAG DOES AND DOES NOT SETTLE: it makes the device
+          # ELIGIBLE. It does not prove the profile check then passes, nor
+          # that anything renders. Those are the next measurements, and a
+          # PNG on disk is still the only thing that means a frame exists.
           #
           # NO -NullRHI. That flag is the whole difference between the boot
           # step above and this one: it means no RHI at all, so nothing can
@@ -898,6 +912,7 @@ jobs:
           timeout 2400 $PFX "$CMD" "$PROJ" \
             -ExecutePythonScript="$GITHUB_WORKSPACE/work/Tools/probe_district.py" \
             -RenderOffScreen -ResX=1280 -ResY=720 \
+            -AllowCPUDevices \
             -LogCmds="LogVulkanRHI Verbose" \
             -unattended -nopause -nosplash -stdout \
             -abslog="$LOG" > /tmp/render.stdout 2>&1
@@ -923,6 +938,31 @@ jobs:
           echo "PNG files written : $SHOTS"
           find "$GITHUB_WORKSPACE/work/Reports" -name '*.png' -newer /tmp/render.mark \
             -printf '  %10s  %p\n' 2>/dev/null | head -20
+          # READ THE PROPERTY BACK. -AllowCPUDevices being on the command
+          # line and the engine ACTING on it are different claims, and this
+          # project has a scar for trusting the first (a write that silently
+          # did nothing and a setting that does nothing measure identically).
+          # These four lines are what say which happened, and they cost
+          # nothing -- the log is already on disk.
+          echo "--- did the CPU device get past the gate? ---"
+          if grep -qE "None of the [0-9]+ devices meet all the criteria" \
+               "$LOG" /tmp/render.stdout 2>/dev/null; then
+            echo "GATE: STILL REJECTED -- the rejection message is still there."
+            echo "      -AllowCPUDevices did NOT get the device through, and"
+            echo "      whatever refuses it now is a DIFFERENT cause from the"
+            echo "      one run 33304835669 found. Do not re-credit that one."
+          else
+            echo "GATE: message ABSENT -- the device was not rejected this way."
+            echo "      This is necessary, NOT sufficient: absence of the"
+            echo "      rejection is not the presence of a frame. The PNG"
+            echo "      count above is what says whether anything rendered."
+          fi
+          echo "--- what the engine says it selected ---"
+          grep -hE "Found device|Chosen device|Selected Device|DeviceID=|Using device|Device [0-9]+:" \
+            "$LOG" /tmp/render.stdout 2>/dev/null | head -12
+          echo "--- the Vulkan profile check, in its own words ---"
+          grep -hE "Vulkan Profile check|SF_VULKAN_SM5|Skipping" \
+            "$LOG" /tmp/render.stdout 2>/dev/null | head -12
           echo "--- the digest lines themselves ---"
           cat /tmp/render.digests
           echo "--- last 60 lines the editor printed ---"
