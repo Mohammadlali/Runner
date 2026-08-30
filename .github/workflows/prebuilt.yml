@@ -1392,10 +1392,19 @@ jobs:
           # A step that needs an environment must MAKE that environment, not
           # inherit it from an input that can silently change underneath.
           echo "installing the software Vulkan driver for this step's own use"
-          $PFX sh -c 'apt-get update -qq && apt-get install -y -qq mesa-vulkan-drivers vulkan-tools' \
+          # ROOT FOR THE INSTALL ONLY. $PFX is `docker exec tbsue`, which runs
+          # as the image's user because Unreal refuses to run as root -- and
+          # apt cannot install as that user. Run 33331939059 got
+          # `driver install rc : 100` and no ICD for exactly this reason,
+          # which is the same wall the vk step hit and solved with -u 0 back
+          # on 2026-08-28. The engine still runs unprivileged; only apt does
+          # not.
+          PFX_ROOT=$(echo "$PFX" | sed 's/docker exec/docker exec -u 0/')
+          echo "install prefix : $PFX_ROOT"
+          $PFX_ROOT sh -c 'apt-get update -qq && apt-get install -y -qq mesa-vulkan-drivers vulkan-tools' \
             > /tmp/vkinstall.txt 2>&1
           echo "driver install rc : $?"
-          tail -2 /tmp/vkinstall.txt
+          tail -3 /tmp/vkinstall.txt
 
           # WHERE THE ICD ACTUALLY IS, asked rather than assumed.
           ICD=$($PFX sh -c 'ls /usr/share/vulkan/icd.d/*.json 2>/dev/null | tr "\n" ":"' | sed 's/:$//')
