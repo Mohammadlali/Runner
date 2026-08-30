@@ -1444,9 +1444,15 @@ jobs:
           #    the SYSTEM loader at 1.3.255. INCOMPATIBLE_DRIVER at instance
           #    creation is a loader that found no usable ICD, so point it at
           #    the one the container actually has.
+          # `docker exec` wants -e BEFORE the container name. Appending it
+          # after gave `docker exec tbsue -e VK_...`, so the container tried
+          # to run `-e` as a command: run 33333255609 reported rc 127 in 0 s
+          # for both E and F. Build the prefix by insertion, like the root
+          # one above, not by appending.
           if [ -n "$ICD" ]; then
-            PFX="$PFX -e VK_ICD_FILENAMES=$ICD -e VK_DRIVER_FILES=$ICD" \
-            run_variant "E_icd_pointed" \
+            PFX_E=$(echo "$PFX" | sed "s|docker exec|docker exec -e VK_ICD_FILENAMES=$ICD -e VK_DRIVER_FILES=$ICD|")
+            echo "E prefix : $PFX_E"
+            PFX="$PFX_E" run_variant "E_icd_pointed" \
               -RenderOffScreen -ResX=1280 -ResY=720 -AllowCPUDevices
           else
             echo "E_icd_pointed            NOT MEASURED -- no ICD json in the container"
@@ -1455,8 +1461,8 @@ jobs:
           # F. same, with the loader saying what it looked at and rejected.
           #    Its own account beats any inference from a failure code.
           if [ -n "$ICD" ]; then
-            PFX="$PFX -e VK_ICD_FILENAMES=$ICD -e VK_LOADER_DEBUG=error,warn,info" \
-            run_variant "F_loader_debug" \
+            PFX_F=$(echo "$PFX" | sed "s|docker exec|docker exec -e VK_ICD_FILENAMES=$ICD -e VK_LOADER_DEBUG=error,warn,info|")
+            PFX="$PFX_F" run_variant "F_loader_debug" \
               -RenderOffScreen -ResX=1280 -ResY=720 -AllowCPUDevices
             echo "  -- what the loader said it was doing --"
             grep -aiE "icd|driver|manifest|LOADER" "$GITHUB_WORKSPACE/v_F_loader_debug.log" \
