@@ -1150,17 +1150,20 @@ jobs:
           # costs zero extra pulls -- the image is already on this disk.
           M="$GITHUB_WORKSPACE/work/Tools/engine_mirror.py"
           df -h / | tail -1
-          python3 "$M" save --image "$IMG" --work "$RUNNER_TEMP/mirror"
-          SRC=$?
-          echo "save_rc=$SRC" >> "$GITHUB_OUTPUT"
-          if [ "$SRC" -ne 0 ]; then
-            echo "save failed -- nothing uploaded. The digest above says why."
-            exit 0
-          fi
-          python3 "$M" upload --repo Mohammadlali/Claud-Cloud-Project \
+          # ONE STREAM, ONE PART ON DISK AT A TIME. The two-phase version
+          # (build the whole archive, then upload it) died in run
+          # 33315992868 with
+          #   zstd: error 70 : Write error : cannot write block :
+          #                    No space left on device
+          # because the pull leaves ~55 GB of image and 60 GB free, and the
+          # archive does not fit beside it. save-upload writes a part, sends
+          # it, deletes it, so the runner's disk stops being a limit.
+          python3 "$M" save-upload --image "$IMG" \
+            --repo Mohammadlali/Claud-Cloud-Project \
             --tag engine-mirror-dev-slim-5.8.2 \
-            --parts "$RUNNER_TEMP/mirror/parts"
-          echo "upload_rc=$?" >> "$GITHUB_OUTPUT"
+            --work "$RUNNER_TEMP/mirror"
+          echo "save_rc=$?" >> "$GITHUB_OUTPUT"
+          df -h / | tail -1
           rm -rf "$RUNNER_TEMP/mirror"
 
       - name: Hand the workspace back to the runner user
