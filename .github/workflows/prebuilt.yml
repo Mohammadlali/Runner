@@ -1592,6 +1592,13 @@ jobs:
               -unattended -nopause -nosplash -stdout \
               > /tmp/gdb.out 2>&1
             echo "gdb rc=$? in $(( $(date +%s) - BEGAN ))s"
+            echo "--- THE ANSWER, pulled straight out of gdb's output ---"
+            # Not left to arrive in the right place among interleaved thread
+            # listings: run 33383501774 printed the header and the line after
+            # it was displaced, then elided from the delivered log.
+            grep -aA3 "WHICH ENTRY POINT" /tmp/gdb.out | cut -c1-190 | sed 's/^/    /'
+            grep -aE "VulkanDynamicAPI|section .bss" /tmp/gdb.out \
+              | head -6 | cut -c1-190 | sed 's/^/    /'
             echo "--- the backtrace, which is the whole point ---"
             # `info sharedlibrary` used to follow `bt` and printed hundreds of
             # module lines; keeping `tail -300` then threw the backtrace away
@@ -1681,8 +1688,14 @@ jobs:
             mkdir -p "$RUNNER_TEMP/variants"
             # head AND tail: the crash report is near the end, the load
             # failures near the start, and neither should be guessed at.
-            { head -120 /tmp/gdb.out; echo "... middle elided ..."; tail -200 /tmp/gdb.out; } \
-              > "$RUNNER_TEMP/variants/G_gdb.log"
+            # KEEP THE WHOLE THING. Run 33383501774 loaded the script, ran
+            # it, and printed "--- WHICH ENTRY POINT ---" -- and the
+            # `info symbol $rax` line right after it landed in the MIDDLE,
+            # which head-120 + tail-200 threw away. The file is ~550 lines.
+            # Eliding the middle of a 550-line log to save nothing, and
+            # losing the one line the run existed for, is the same mistake
+            # as the `cut -c1-60` that truncated the fatal error.
+            cp /tmp/gdb.out "$RUNNER_TEMP/variants/G_gdb.log"
           else
             echo "G_gdb                    NOT MEASURED -- gdb is not in the container"
           fi
