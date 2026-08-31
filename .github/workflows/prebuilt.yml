@@ -1529,6 +1529,13 @@ jobs:
             # asking whether the file arrived, and gdb's warning was the only
             # thing that said so.
             G=/tmp/crash.gdb
+            # `docker exec` WITHOUT -i DOES NOT FORWARD STDIN. Run
+            # 33380808286 piped the script in and the check reported
+            # `0 lines` -- the pipe fed nothing at all. Fourth attempt at
+            # getting one file into this container, and the first three each
+            # failed for a different reason. The check is what stopped this
+            # one becoming another silent wrong answer.
+            PFX_IN=$(echo "$PFX" | sed 's/docker exec/docker exec -i/')
             {
               echo "set pagination off"
               echo "run"
@@ -1557,7 +1564,7 @@ jobs:
               echo "except gdb.error as e:"
               echo "    print('no disassembly:', e)"
               echo "end"
-            } | $PFX sh -c "cat > $G"
+            } | $PFX_IN sh -c "cat > $G"
             # READ IT BACK. A script gdb cannot open produces a warning and a
             # run that silently answers the previous question instead.
             GLINES=$($PFX sh -c "wc -l < $G" 2>/dev/null | tr -d ' ')
