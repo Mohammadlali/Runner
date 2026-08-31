@@ -1491,17 +1491,28 @@ jobs:
               -ex 'set pagination off' \
               -ex 'run' \
               -ex 'bt 40' \
-              -ex 'info sharedlibrary' \
+              -ex 'info registers rip' \
               --args "$CMD" "$PROJ" \
               -RenderOffScreen -ResX=1280 -ResY=720 -AllowCPUDevices \
               -unattended -nopause -nosplash -stdout \
               > /tmp/gdb.out 2>&1
             echo "gdb rc=$? in $(( $(date +%s) - BEGAN ))s"
             echo "--- the backtrace, which is the whole point ---"
-            grep -aE "^#[0-9]+|SIGSEGV|Program received|Thread .* received" /tmp/gdb.out \
-              | head -45 | cut -c1-190
+            # `info sharedlibrary` used to follow `bt` and printed hundreds of
+            # module lines; keeping `tail -300` then threw the backtrace away
+            # (run 33335940122 delivered 300 lines of shared libraries and no
+            # stack). Keep the LAST 120 lines of gdb's own output, which is
+            # where a batch backtrace ends up, and drop the flood.
+            grep -aE "^#[0-9]+|SIGSEGV|SIGABRT|Program received|Thread .* received|signal" \
+              /tmp/gdb.out | head -50 | cut -c1-190
+            echo "--- gdb output size: $(wc -l < /tmp/gdb.out) lines ---"
+            echo "--- its last 25 lines, whatever they are ---"
+            tail -25 /tmp/gdb.out | cut -c1-170
             mkdir -p "$RUNNER_TEMP/variants"
-            tail -300 /tmp/gdb.out > "$RUNNER_TEMP/variants/G_gdb.log"
+            # head AND tail: the crash report is near the end, the load
+            # failures near the start, and neither should be guessed at.
+            { head -120 /tmp/gdb.out; echo "... middle elided ..."; tail -200 /tmp/gdb.out; } \
+              > "$RUNNER_TEMP/variants/G_gdb.log"
           else
             echo "G_gdb                    NOT MEASURED -- gdb is not in the container"
           fi
