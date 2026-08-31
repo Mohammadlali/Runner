@@ -1522,6 +1522,22 @@ jobs:
               /tmp/gdb.out | head -50 | cut -c1-190
             echo "--- what is on the faulting stack (the caller lives here) ---"
             sed -n '/x\/12a/,$p' /tmp/gdb.out 2>/dev/null | head -20 | cut -c1-180
+            # IS SYMBOLISATION EVEN POSSIBLE? Ask before building more.
+            # Run 33365504110 answered `No symbol matches $pc.` four times
+            # while the SAME backtrace resolved FRHICommandListBase::Execute().
+            # Two candidate reasons, and they are different answers: the .so
+            # exports too little, or `frame N` ran on the WRONG THREAD --
+            # gdb printed "[Switching to Thread ...]" to an id that is not
+            # Thread 41, so the frames it selected were never the RHIThread's.
+            # This says which, and costs one nm.
+            VKSO=/home/ue4/UnrealEngine/Engine/Binaries/Linux/libUnrealEditor-VulkanRHI.so
+            echo "--- dynamic symbols exported by VulkanRHI.so ---"
+            $PFX sh -c "nm -D --defined-only $VKSO 2>&1 | wc -l"
+            $PFX sh -c "nm -D --defined-only -C $VKSO 2>/dev/null | head -4" | cut -c1-150
+            echo "--- the library's load base, for offset arithmetic ---"
+            grep -aE "VulkanRHI.so|libUnrealEditor-RHI.so" /tmp/gdb.out \
+              | grep -aE "^0x" | head -3 | cut -c1-140
+
             echo "--- WHICH FUNCTION: the caller frames, resolved ---"
             # `info symbol` reads the DYNAMIC symbol table, which a stripped
             # .so still carries for everything it exports. The bt frames
