@@ -1511,7 +1511,24 @@ jobs:
             # its absence is why no SELECTED THREAD or $rax line ever
             # appeared. $GITHUB_WORKSPACE is bind-mounted, so both sides see
             # a file written there.
-            G="$GITHUB_WORKSPACE/crash.gdb"
+            # WRITE IT FROM INSIDE THE CONTAINER. Third path failure of the
+            # same shape:
+            #   /tmp/crash.gdb                     host /tmp, not the
+            #                                      container's (run 33374652125)
+            #   $GITHUB_WORKSPACE/crash.gdb        the container sees that
+            #                                      path, but the workspace was
+            #                                      chowned to the image's user,
+            #                                      so this shell cannot write
+            #                                      there (run 33377673314) --
+            #                                      the same Permission denied
+            #                                      that cost run 33200211918
+            #                                      its two dumps.
+            # Piping through the container settles both at once: it writes as
+            # the user that will read it, in the filesystem that will read it.
+            # AND THE WRITE IS CHECKED. I shipped this twice without ever
+            # asking whether the file arrived, and gdb's warning was the only
+            # thing that said so.
+            G=/tmp/crash.gdb
             {
               echo "set pagination off"
               echo "run"
@@ -1540,7 +1557,16 @@ jobs:
               echo "except gdb.error as e:"
               echo "    print('no disassembly:', e)"
               echo "end"
-            } > "$G"
+            } | $PFX sh -c "cat > $G"
+            # READ IT BACK. A script gdb cannot open produces a warning and a
+            # run that silently answers the previous question instead.
+            GLINES=$($PFX sh -c "wc -l < $G" 2>/dev/null | tr -d ' ')
+            echo "gdb script inside the container : ${GLINES:-0} lines"
+            if [ "${GLINES:-0}" -lt 10 ]; then
+              echo "::error::the gdb script did not arrive in the container."
+              echo "::error::Everything below comes from the -ex flags, not"
+              echo "::error::from the script, and no \$rax lookup will run."
+            fi
             BEGAN=$(date +%s)
             timeout 900 $PFX gdb -batch -q -x "$G" \
               -ex 'set pagination off' \
