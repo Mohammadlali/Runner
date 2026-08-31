@@ -1495,6 +1495,10 @@ jobs:
               -ex 'info threads' \
               -ex 'thread apply all bt 8' \
               -ex 'x/12a $sp' \
+              -ex 'frame 1' -ex 'info symbol $pc' -ex 'x/6i $pc-24' \
+              -ex 'frame 2' -ex 'info symbol $pc' \
+              -ex 'frame 5' -ex 'info symbol $pc' \
+              -ex 'frame 6' -ex 'info symbol $pc' \
               --args "$CMD" "$PROJ" \
               -RenderOffScreen -ResX=1280 -ResY=720 -AllowCPUDevices \
               -unattended -nopause -nosplash -stdout \
@@ -1518,6 +1522,16 @@ jobs:
               /tmp/gdb.out | head -50 | cut -c1-190
             echo "--- what is on the faulting stack (the caller lives here) ---"
             sed -n '/x\/12a/,$p' /tmp/gdb.out 2>/dev/null | head -20 | cut -c1-180
+            echo "--- WHICH FUNCTION: the caller frames, resolved ---"
+            # `info symbol` reads the DYNAMIC symbol table, which a stripped
+            # .so still carries for everything it exports. The bt frames
+            # printed as `??` only because there is no DEBUG info; the
+            # nearest exported symbol is still recoverable, and that is the
+            # name this whole investigation has been missing.
+            # `x/6i $pc-24` shows the instruction that made the call, which
+            # is where the null came from.
+            sed -n '/^#1 /,$p' /tmp/gdb.out 2>/dev/null \
+              | grep -aE "in section|\+ [0-9]+ in|=> |call|mov " | head -20 | cut -c1-175
             echo "--- other threads, which DO have walkable stacks ---"
             grep -aE "^Thread [0-9]+|^#[0-9]+ .*(Vulkan|RHI|Render)" /tmp/gdb.out \
               | head -30 | cut -c1-180
