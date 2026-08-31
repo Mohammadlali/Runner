@@ -47,7 +47,7 @@ on:
         required: false
         default: 'ghcr'
       mirror:
-        description: 'off | roundtrip | ghcrcheck | save | restore | crashmatrix | elf | icd -- only save touches ghcr'
+        description: 'off | roundtrip | ghcrcheck | save | restore | crashmatrix | elf | icd | cvars -- only save touches ghcr'
         required: false
         default: 'off'
       render:
@@ -1325,6 +1325,38 @@ jobs:
             --format 'PRESENT id={{.Id}} size={{.Size}}' 2>&1 | head -2
           echo "image_present_rc=$?" >> "$GITHUB_OUTPUT"
           docker images --format '{{.Repository}}:{{.Tag}} {{.Size}}' | head -5
+
+      - name: cvars -- what lever turns the missing extension off?
+        id: cvars
+        if: ${{ always() && inputs.mirror == 'cvars' && steps.pull.outputs.rc == '0' }}
+        env:
+          PFX: ${{ steps.pull.outputs.exec }}
+        run: |
+          set +e
+          # Run 33391279447 settled it: lavapipe is Vulkan 1.3.255 and has no
+          # VK_KHR_dynamic_rendering_local_read anywhere -- not the KHR name,
+          # not the core name, not in the device's extension list. The engine
+          # asks for it regardless. So the fix is on the ENGINE side, and the
+          # question is which switch it answers to.
+          #
+          # No boot: the console variable NAMES are string literals in the
+          # binaries. Read them.
+          B=/home/ue4/UnrealEngine/Engine/Binaries/Linux
+          for L in VulkanRHI RHI RenderCore Engine; do
+            SO="$B/libUnrealEditor-$L.so"
+            echo "--- $L: cvars mentioning dynamic rendering, local read or input attachments ---"
+            $PFX sh -c "strings $SO 2>/dev/null" \
+              | grep -aoE "r\.[A-Za-z0-9_.]*([Dd]ynamicRendering|[Ll]ocalRead|[Ii]nputAttachment|[Ss]ubpass)[A-Za-z0-9_.]*" \
+              | sort -u | sed 's/^/    /'
+          done
+          echo "--- every r.Vulkan.* the RHI knows, so the lever cannot hide ---"
+          $PFX sh -c "strings $B/libUnrealEditor-VulkanRHI.so 2>/dev/null" \
+            | grep -aoE "r\.Vulkan\.[A-Za-z0-9_.]+" | sort -u | sed 's/^/    /'
+          echo "--- the help text around them, if any string carries it ---"
+          $PFX sh -c "strings $B/libUnrealEditor-VulkanRHI.so 2>/dev/null" \
+            | grep -aiE "dynamic.rendering|local.read|input.attachment" \
+            | sort -u | head -30 | cut -c1-170 | sed 's/^/    /'
+          echo "##TBS##{\"probe\": \"cvar_lever\", \"status\": \"pass\", \"v\": 1}"
 
       - name: icd -- does lavapipe have the entry point, and under which name?
         id: icd
