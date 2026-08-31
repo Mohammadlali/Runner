@@ -1512,6 +1512,7 @@ jobs:
               echo "        t.switch(); sel = t.name; break"
               echo "print('SELECTED THREAD:', sel or '<no RHIThread found>')"
               echo "gdb.execute('bt 14')"
+              echo "gdb.execute('info proc mappings')"
               echo "for i in range(1, 8):"
               echo "    try:"
               echo "        gdb.execute('frame %d' % i)"
@@ -1573,6 +1574,18 @@ jobs:
             echo "--- dynamic symbols exported by VulkanRHI.so ---"
             $PFX sh -c "nm -D --defined-only $VKSO 2>&1 | wc -l"
             $PFX sh -c "nm -D --defined-only -C $VKSO 2>/dev/null | head -4" | cut -c1-150
+            # A COUNT IS NOT A CENSUS. Run 33367512993 reported 4657 symbols
+            # and I read that as "symbolisation is possible"; the four sampled
+            # names were ALSA_bootstrap and ConvertAudio* -- SDL and audio,
+            # not Unreal. Unreal builds with hidden visibility, so its own
+            # functions may export nothing at all. Mangled C++ names are the
+            # discriminator, and `info symbol` can never name a frame that
+            # has none.
+            echo "--- of those, how many are mangled C++ (_ZN...)? ---"
+            $PFX sh -c "nm -D --defined-only $VKSO 2>/dev/null | grep -c ' _ZN'"
+            echo "--- a sample of the C++ ones, if any exist ---"
+            $PFX sh -c "nm -D --defined-only -C $VKSO 2>/dev/null | grep -E ' (FVulkan|FRHI|Vulkan)' | head -4" \
+              | cut -c1-150
             echo "--- the library's load base, for offset arithmetic ---"
             grep -aE "VulkanRHI.so|libUnrealEditor-RHI.so" /tmp/gdb.out \
               | grep -aE "^0x" | head -3 | cut -c1-140
@@ -1587,6 +1600,30 @@ jobs:
             # is where the null came from.
             sed -n '/^#1 /,$p' /tmp/gdb.out 2>/dev/null \
               | grep -aE "in section|\+ [0-9]+ in|=> |call|mov " | head -20 | cut -c1-175
+            # RESOLVE BY OFFSET, because `info symbol` needs an exported
+            # symbol and these frames may have none. addr2line works off the
+            # file on disk and does not care what is exported -- but it needs
+            # the address relative to the library's load base, which is only
+            # knowable while the process is mapped. That is what the
+            # `info proc mappings` above captured.
+            echo "--- resolving the VulkanRHI frames by file offset ---"
+            for SO in libUnrealEditor-VulkanRHI.so libUnrealEditor-Engine.so; do
+              BASE=$(grep -a "$SO" /tmp/gdb.out | grep -aoE "^ *0x[0-9a-f]+" \
+                     | tr -d ' ' | sort -u | head -1)
+              if [ -z "$BASE" ]; then
+                echo "  $SO : NOT MEASURED -- no mapping line captured"
+                continue
+              fi
+              echo "  $SO base=$BASE"
+              for PC in $(grep -aE "^#[0-9]+ +0x[0-9a-f]+ .*$SO" /tmp/gdb.out \
+                          | grep -aoE "0x[0-9a-f]{12,}" | head -3); do
+                OFF=$(printf '0x%x' $(( PC - BASE )))
+                NAME=$($PFX sh -c "addr2line -f -C -e /home/ue4/UnrealEngine/Engine/Binaries/Linux/$SO $OFF 2>&1 | head -2" \
+                       | tr '\n' ' ')
+                echo "    $PC  offset $OFF  ->  ${NAME:-<addr2line said nothing>}"
+              done
+            done
+
             echo "--- other threads, which DO have walkable stacks ---"
             grep -aE "^Thread [0-9]+|^#[0-9]+ .*(Vulkan|RHI|Render)" /tmp/gdb.out \
               | head -30 | cut -c1-180
