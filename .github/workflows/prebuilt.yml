@@ -1492,6 +1492,9 @@ jobs:
               -ex 'run' \
               -ex 'bt 40' \
               -ex 'info registers rip' \
+              -ex 'info threads' \
+              -ex 'thread apply all bt 8' \
+              -ex 'x/12a $sp' \
               --args "$CMD" "$PROJ" \
               -RenderOffScreen -ResX=1280 -ResY=720 -AllowCPUDevices \
               -unattended -nopause -nosplash -stdout \
@@ -1503,8 +1506,21 @@ jobs:
             # (run 33335940122 delivered 300 lines of shared libraries and no
             # stack). Keep the LAST 120 lines of gdb's own output, which is
             # where a batch backtrace ends up, and drop the flood.
-            grep -aE "^#[0-9]+|SIGSEGV|SIGABRT|Program received|Thread .* received|signal" \
+            # `bt` CANNOT WALK A STACK FROM 0x0. Run 33359633510 showed
+            #   Thread 41 "RHIThread" received signal SIGSEGV
+            #   0x0000000000000000 in ?? ()      rip 0x0
+            # -- the program JUMPED to a null function pointer, so there is
+            # no frame to unwind and `bt` prints nothing useful. The return
+            # address of whoever made the call is still sitting on the
+            # stack, which is what `x/12a $sp` is for, and the other threads
+            # still have walkable stacks.
+            grep -aE "^#[0-9]+|SIGSEGV|SIGABRT|Program received|Thread .* received|^0x|rip " \
               /tmp/gdb.out | head -50 | cut -c1-190
+            echo "--- what is on the faulting stack (the caller lives here) ---"
+            sed -n '/x\/12a/,$p' /tmp/gdb.out 2>/dev/null | head -20 | cut -c1-180
+            echo "--- other threads, which DO have walkable stacks ---"
+            grep -aE "^Thread [0-9]+|^#[0-9]+ .*(Vulkan|RHI|Render)" /tmp/gdb.out \
+              | head -30 | cut -c1-180
             echo "--- gdb output size: $(wc -l < /tmp/gdb.out) lines ---"
             echo "--- its last 25 lines, whatever they are ---"
             tail -25 /tmp/gdb.out | cut -c1-170
