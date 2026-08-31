@@ -1486,8 +1486,47 @@ jobs:
           # stack.
           if $PFX sh -c 'command -v gdb' > /dev/null 2>&1; then
             echo "=== G: the same crash, under gdb ==="
+            # A GDB SCRIPT FILE, BUILT WITH echo, NOT A HEREDOC.
+            #
+            # Run 33367512993 measured 4657 dynamic symbols in
+            # libUnrealEditor-VulkanRHI.so, so symbolisation IS possible and
+            # the earlier `No symbol matches $pc.` was not missing symbols --
+            # it was `frame N` running on the wrong thread, because gdb's
+            # "[Switching to Thread ...]" after the signal lands somewhere
+            # that is not Thread 41.
+            #
+            # Selecting the RHIThread needs a loop. Multi-line gdb python in
+            # an -ex flag broke this workflow's YAML, and so did a heredoc:
+            # both put text in column 0 inside a block scalar. echo lines
+            # stay indented for YAML while their CONTENT starts at column 0,
+            # which is what gdb's python needs.
+            G=/tmp/crash.gdb
+            {
+              echo "set pagination off"
+              echo "run"
+              echo "python"
+              echo "import gdb"
+              echo "sel = None"
+              echo "for t in gdb.selected_inferior().threads():"
+              echo "    if t.name and 'RHIThread' in t.name:"
+              echo "        t.switch(); sel = t.name; break"
+              echo "print('SELECTED THREAD:', sel or '<no RHIThread found>')"
+              echo "gdb.execute('bt 14')"
+              echo "for i in range(1, 8):"
+              echo "    try:"
+              echo "        gdb.execute('frame %d' % i)"
+              echo "        gdb.execute('info symbol \$pc')"
+              echo "    except gdb.error as e:"
+              echo "        print('frame %d unavailable: %s' % (i, e))"
+              echo "try:"
+              echo "    gdb.execute('frame 1')"
+              echo "    gdb.execute('x/8i \$pc-28')"
+              echo "except gdb.error as e:"
+              echo "    print('no disassembly:', e)"
+              echo "end"
+            } > "$G"
             BEGAN=$(date +%s)
-            timeout 900 $PFX gdb -batch -q \
+            timeout 900 $PFX gdb -batch -q -x "$G" \
               -ex 'set pagination off' \
               -ex 'run' \
               -ex 'bt 40' \
