@@ -47,7 +47,7 @@ on:
         required: false
         default: 'ghcr'
       mirror:
-        description: 'off | roundtrip | ghcrcheck | save | restore | crashmatrix | elf -- only save touches ghcr'
+        description: 'off | roundtrip | ghcrcheck | save | restore | crashmatrix | elf | icd -- only save touches ghcr'
         required: false
         default: 'off'
       render:
@@ -1325,6 +1325,61 @@ jobs:
             --format 'PRESENT id={{.Id}} size={{.Size}}' 2>&1 | head -2
           echo "image_present_rc=$?" >> "$GITHUB_OUTPUT"
           docker images --format '{{.Repository}}:{{.Tag}} {{.Size}}' | head -5
+
+      - name: icd -- does lavapipe have the entry point, and under which name?
+        id: icd
+        if: ${{ always() && inputs.mirror == 'icd' && steps.pull.outputs.rc == '0' }}
+        env:
+          PFX: ${{ steps.pull.outputs.exec }}
+        run: |
+          set +e
+          # THE QUESTION, and it has exactly two answers with different fixes.
+          #
+          # Run 33389073899 named the null slot:
+          # VulkanDynamicAPI::vkCmdSetRenderingInputAttachmentIndicesKHR, from
+          # VK_KHR_dynamic_rendering_local_read. The engine calls it and it
+          # was never filled in. Either:
+          #
+          #   (a) lavapipe does not implement the extension at all -- then
+          #       the engine must be told not to use it; or
+          #   (b) lavapipe has it under the un-suffixed Vulkan 1.4 name
+          #       `vkCmdSetRenderingInputAttachmentIndices` and the engine
+          #       asked for the KHR spelling -- a lookup-name mismatch.
+          #
+          # `nm -D` on the ICD and `strings` on the engine answer both, with
+          # no engine boot. NEITHER is a guess: both read a file.
+          PFX_ROOT=$(echo "$PFX" | sed 's/docker exec/docker exec -u 0/')
+          $PFX_ROOT sh -c 'apt-get update -qq && apt-get install -y -qq mesa-vulkan-drivers vulkan-tools' \
+            > /tmp/vkinstall.txt 2>&1
+          echo "driver install rc : $?"
+          echo "--- the ICD json the loader will read ---"
+          $PFX sh -c 'ls -1 /usr/share/vulkan/icd.d/*.json 2>/dev/null' | sed 's/^/    /'
+          $PFX sh -c 'cat /usr/share/vulkan/icd.d/*.json 2>/dev/null' | cut -c1-190 | sed 's/^/    /'
+          echo "--- the driver library itself ---"
+          LVP=$($PFX sh -c 'ls -1 /usr/lib/x86_64-linux-gnu/libvulkan_lvp.so 2>/dev/null')
+          echo "    ${LVP:-<libvulkan_lvp.so not found>}"
+          $PFX sh -c 'ls -1 /usr/lib/x86_64-linux-gnu/libvulkan_*.so* 2>/dev/null' | sed 's/^/    /'
+          echo "--- (a) OR (b): which spellings does the DRIVER export? ---"
+          for L in $($PFX sh -c 'ls -1 /usr/lib/x86_64-linux-gnu/libvulkan_*.so* 2>/dev/null'); do
+            echo "    == $L =="
+            $PFX sh -c "nm -D $L 2>/dev/null" \
+              | grep -ai "RenderingInputAttachmentIndices" | sed 's/^/      /'
+            $PFX sh -c "strings $L 2>/dev/null" \
+              | grep -ai "dynamic_rendering_local_read" | sort -u | sed 's/^/      /'
+          done
+          echo "--- and which spelling does the ENGINE ask for? ---"
+          SO=/home/ue4/UnrealEngine/Engine/Binaries/Linux/libUnrealEditor-VulkanRHI.so
+          $PFX sh -c "strings $SO 2>/dev/null" \
+            | grep -ai "RenderingInputAttachmentIndices\|dynamic_rendering_local_read" \
+            | sort -u | sed 's/^/    /'
+          echo "--- what the driver reports it can do ---"
+          $PFX sh -c 'vulkaninfo --summary 2>&1' \
+            | grep -aiE "apiVersion|driverName|deviceName|GPU[0-9]" \
+            | head -12 | cut -c1-150 | sed 's/^/    /'
+          echo "--- is the extension in the device's list? ---"
+          $PFX sh -c 'vulkaninfo 2>/dev/null' \
+            | grep -ai "dynamic_rendering_local_read" | sort -u | sed 's/^/    /'
+          echo "##TBS##{\"probe\": \"icd_entry_point\", \"status\": \"pass\", \"v\": 1}"
 
       - name: elf -- name the pointer the faulting call went through
         id: elf
