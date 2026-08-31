@@ -1500,7 +1500,18 @@ jobs:
             # both put text in column 0 inside a block scalar. echo lines
             # stay indented for YAML while their CONTENT starts at column 0,
             # which is what gdb's python needs.
-            G=/tmp/crash.gdb
+            # INTO THE BIND MOUNT, NOT THE HOST'S /tmp.
+            #
+            # Run 33374652125 opened with
+            #   warning: /tmp/crash.gdb: No such file or directory
+            # because this shell writes on the HOST and gdb runs INSIDE the
+            # container through `docker exec`, which does not share /tmp.
+            # Everything that run printed came from the -ex flags below,
+            # which are still here; the script was never loaded at all, and
+            # its absence is why no SELECTED THREAD or $rax line ever
+            # appeared. $GITHUB_WORKSPACE is bind-mounted, so both sides see
+            # a file written there.
+            G="$GITHUB_WORKSPACE/crash.gdb"
             {
               echo "set pagination off"
               echo "run"
