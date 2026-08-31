@@ -47,7 +47,7 @@ on:
         required: false
         default: 'ghcr'
       mirror:
-        description: 'off | roundtrip | ghcrcheck | save | restore | crashmatrix -- only save touches ghcr'
+        description: 'off | roundtrip | ghcrcheck | save | restore | crashmatrix | elf -- only save touches ghcr'
         required: false
         default: 'off'
       render:
@@ -1326,6 +1326,55 @@ jobs:
           echo "image_present_rc=$?" >> "$GITHUB_OUTPUT"
           docker images --format '{{.Repository}}:{{.Tag}} {{.Size}}' | head -5
 
+      - name: elf -- name the pointer the faulting call went through
+        id: elf
+        if: ${{ always() && inputs.mirror == 'elf' && steps.pull.outputs.rc == '0' }}
+        env:
+          PFX: ${{ steps.pull.outputs.exec }}
+        run: |
+          set +e
+          # NO ENGINE RUN, AND NO DEBUGGER. Run 33385961236 already printed
+          # the instruction and the library base, and those two pin the slot
+          # without needing a register, a driver, or a crash:
+          #
+          #   base                     0x7fed1d977000
+          #   mov 0x37e2f0(%rip),%rax  at 0x7fed1db78101  -> 0x7fed1def63f8
+          #   call *(%rax)             at 0x7fed1db78114
+          #
+          #   slot 0x7fed1def63f8 - base = 0x57f3f8
+          #   call 0x7fed1db78114 - base = 0x201114
+          #
+          # `info symbol $rax` could NOT answer it. gdb was sitting in frame
+          # 1, where %rax is caller-saved and unrecoverable, so it printed
+          # 0x192f3520 -- a number that is not an address in this process at
+          # all (libraries are at 0x7f..., the heap at 0x63e...). The command
+          # ran and answered honestly; it was the wrong command.
+          #
+          # These offsets are in the FILE. Read the file.
+          SO=/home/ue4/UnrealEngine/Engine/Binaries/Linux/libUnrealEditor-VulkanRHI.so
+          echo "--- which binutils the container has ---"
+          $PFX sh -c "command -v readelf; command -v objdump; command -v nm" 2>&1 \
+            | sed 's/^/    /'
+          echo "--- THE ANSWER: the relocation on the slot at +0x57f3f8 ---"
+          $PFX sh -c "readelf -rW $SO" 2>/dev/null \
+            | grep -ai "57f3f8" | cut -c1-190 | sed 's/^/    /'
+          echo "--- which section +0x57f3f8 falls in ---"
+          $PFX sh -c "readelf -SW $SO" 2>/dev/null \
+            | grep -aE "\.got|\.data|\.bss|\.rela" | cut -c1-140 | sed 's/^/    /'
+          echo "--- defined symbols in 0x57f000-0x57ffff, both sides of the slot ---"
+          $PFX sh -c "nm -C -n -D $SO" 2>/dev/null \
+            | grep -a "^000000000057f" | cut -c1-160 | sed 's/^/    /'
+          echo "--- WHICH FUNCTION makes the call: disassembly around +0x201114 ---"
+          $PFX sh -c "objdump -d --start-address=0x2010c0 --stop-address=0x201130 $SO" 2>&1 \
+            | tail -32 | cut -c1-170 | sed 's/^/    /'
+          echo "--- what the slot holds in the file, before the loader touches it ---"
+          $PFX sh -c "objdump -s --start-address=0x57f3f0 --stop-address=0x57f400 $SO" 2>&1 \
+            | tail -6 | cut -c1-170 | sed 's/^/    /'
+          echo "--- for comparison: where the VulkanDynamicAPI block actually starts ---"
+          $PFX sh -c "nm -C -n -D $SO" 2>/dev/null \
+            | grep -a "VulkanDynamicAPI" | head -3 | sed 's/^/    /'
+          echo "##TBS##{\"probe\": \"elf_slot_lookup\", \"status\": \"pass\", \"v\": 1}"
+
       - name: crashmatrix -- which of the three differences causes the SIGSEGV?
         id: crashmatrix
         if: ${{ always() && inputs.mirror == 'crashmatrix' && steps.pull.outputs.rc == '0' }}
@@ -2013,7 +2062,16 @@ jobs:
             mkdir -p "Reports/cloud_host/variants_${RUN_ID}"
             for F in "$RUNNER_TEMP"/variants/*.log; do
               [ -f "$F" ] || continue
-              tail -400 "$F" > "Reports/cloud_host/variants_${RUN_ID}/$(basename "$F")"
+              # THE THIRD PLACE THAT ELIDED THE ANSWER. Run 33385961236's
+              # gdb output was 6827 lines; this `tail -400` delivered the
+              # last 400 and threw away every line the script printed,
+              # including `info symbol $rax`. An engine log can afford a
+              # tail -- a debugger transcript cannot, because the line that
+              # matters is wherever the debugger chose to put it.
+              case "$(basename "$F")" in
+                *gdb*) cp "$F" "Reports/cloud_host/variants_${RUN_ID}/$(basename "$F")" ;;
+                *)     tail -400 "$F" > "Reports/cloud_host/variants_${RUN_ID}/$(basename "$F")" ;;
+              esac
             done
             git add -f "Reports/cloud_host/variants_${RUN_ID}"
           fi
