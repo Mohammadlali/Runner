@@ -50,6 +50,10 @@ on:
         description: 'off | roundtrip | ghcrcheck | save | restore | crashmatrix | elf | icd | cvars -- only save touches ghcr'
         required: false
         default: 'off'
+      android:
+        description: 'ask whether this engine image has an Android SDK/NDK, and make UBT name what is missing'
+        type: boolean
+        default: false
       render:
         description: 'ask whether this container can render, then render Valiasr offscreen'
         type: boolean
@@ -678,6 +682,79 @@ jobs:
           fi
           echo "--- last 40 lines of the build log ---"
           tail -40 /tmp/build.log 2>/dev/null
+
+      - name: android -- does this engine image have an Android toolchain, and what does UBT say is missing
+        id: android
+        if: ${{ steps.secret.outputs.ok == 'yes' && (steps.find.outputs.found == 'yes' || steps.pull.outputs.rc == '0') && inputs.android }}
+        env:
+          ENG:  ${{ steps.find.outputs.engine || steps.pull.outputs.engine }}
+          PFX:  ${{ steps.pull.outputs.exec }}
+        run: |
+          set +e
+          # WHY THIS STEP EXISTS. The project's target became an Android phone
+          # on 2026-09-02. Everything written since is INPUT: an ini, a device
+          # profile, a gate, and a cook command line. Nothing has cooked.
+          #
+          # A grep for SetupAndroid, NDKROOT, ANDROID_HOME and ndk across every
+          # tracked .py, .yml and .cs in this project returns ZERO hits, so
+          # nothing here installs an Android toolchain and nothing checks for
+          # one. That is a fact about OUR REPOSITORY and says nothing about
+          # Epic's image -- which is exactly the generalisation this project
+          # has made wrong seven times. So: ask the image.
+          #
+          # THE DECISIVE COMMAND IS THE LAST ONE. Build.sh for the GAME target
+          # on Android either compiles or prints, in UBT's own words, what it
+          # cannot find. That sentence is the measurement. The file listings
+          # above it are context, so that "no SDK" and "no Android support in
+          # this engine tree at all" cannot be confused for each other.
+          PROJ="$GITHUB_WORKSPACE/work/TehranBlindSpot.uproject"
+          BUILD="$ENG/Engine/Build/BatchFiles/Linux/Build.sh"
+          FOUND_SETUP=no; FOUND_SDK=no; FOUND_NDK=no; RC=0
+
+          echo "=== 1. does the ENGINE tree carry Android support at all ==="
+          for P in \
+            "$ENG/Engine/Extras/Android/SetupAndroid.sh" \
+            "$ENG/Engine/Platforms/Android" \
+            "$ENG/Engine/Build/Android"
+          do
+            if $PFX test -e "$P"; then echo "  present : $P"; FOUND_SETUP=yes
+            else echo "  absent  : $P"; fi
+          done
+
+          echo "=== 2. what the ENVIRONMENT inside the container has ==="
+          for V in ANDROID_HOME ANDROID_SDK_ROOT NDKROOT ANDROID_NDK_ROOT JAVA_HOME; do
+            echo "  $V = $($PFX printenv "$V" 2>/dev/null || echo '<unset>')"
+          done
+          $PFX test -d "$ANDROID_HOME" && FOUND_SDK=yes
+          echo "  --- runner-side android dirs, for contrast with the container ---"
+          ls -1 /usr/local/lib/android 2>/dev/null | head -5 || echo "  none on the runner either"
+
+          echo "=== 3. THE DECISIVE ONE: ask UBT to build the game for Android ==="
+          if ! $PFX test -f "$BUILD"; then
+            echo "rc=91" >> "$GITHUB_OUTPUT"
+            echo "NO Build.sh AT $BUILD -- this engine tree has no build tool,"
+            echo "so this run says NOTHING about Android. Not a negative result."
+            exit 0
+          fi
+          BEGAN=$(date +%s)
+          $PFX "$BUILD" TehranBlindSpot Android Development \
+            -project="$PROJ" -waitmutex -NoUba > /tmp/android.log 2>&1
+          RC=$?
+          SECS=$(( $(date +%s) - BEGAN ))
+          echo "android build rc=$RC in ${SECS}s"
+          echo "rc=$RC" >> "$GITHUB_OUTPUT"
+
+          # UBT's own sentence, hunted for by name. If none of these match, the
+          # tail below is what a reader gets, and "no pattern matched" is
+          # reported as exactly that rather than as "no problem found".
+          echo "--- lines naming an SDK, NDK or platform problem ---"
+          grep -n -i -E "sdk|ndk|android.*not|not.*android|platform.*valid|UnrealBuildTool.*Exception" \
+            /tmp/android.log 2>/dev/null | head -25 || echo "  NO PATTERN MATCHED (not the same as no problem)"
+          echo "--- last 40 lines of the android build log ---"
+          tail -40 /tmp/android.log 2>/dev/null
+
+          printf '##TBS##{"v":1,"probe":"android_toolchain_host","status":"%s","data":{"build_rc":%s,"secs":%s,"engine_android_files":"%s","sdk_env_dir":"%s"}}\n' \
+            "$([ "$RC" = "0" ] && echo pass || echo fail)" "$RC" "$SECS" "$FOUND_SETUP" "$FOUND_SDK"
 
       - name: Start it on this project
         id: boot
