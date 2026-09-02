@@ -54,6 +54,10 @@ on:
         description: 'ask whether this engine image has an Android SDK/NDK, and make UBT name what is missing'
         type: boolean
         default: false
+      androidwhy:
+        description: 'ask the engine WHY it refuses Android -- inventory, installed-platform config, and the source of the refusal sentence'
+        type: boolean
+        default: false
       render:
         description: 'ask whether this container can render, then render Valiasr offscreen'
         type: boolean
@@ -726,8 +730,17 @@ jobs:
             echo "  $V = $($PFX printenv "$V" 2>/dev/null || echo '<unset>')"
           done
           $PFX test -d "$ANDROID_HOME" && FOUND_SDK=yes
+          # FIXED 2026-09-02, same day, after run 33659536622 showed this line
+          # measuring NOTHING: it was `ls ... | head -5 || echo none`, and head
+          # exits 0 on empty input, so the fallback never fired and a blank
+          # could not be told from an absent directory. An explicit test can.
           echo "  --- runner-side android dirs, for contrast with the container ---"
-          ls -1 /usr/local/lib/android 2>/dev/null | head -5 || echo "  none on the runner either"
+          if [ -d /usr/local/lib/android ]; then
+            echo "  /usr/local/lib/android EXISTS, first entries:"
+            ls -1 /usr/local/lib/android 2>/dev/null | head -5
+          else
+            echo "  /usr/local/lib/android DOES NOT EXIST on the runner"
+          fi
 
           echo "=== 3. THE DECISIVE ONE: ask UBT to build the game for Android ==="
           if ! $PFX test -f "$BUILD"; then
@@ -755,6 +768,74 @@ jobs:
 
           printf '##TBS##{"v":1,"probe":"android_toolchain_host","status":"%s","data":{"build_rc":%s,"secs":%s,"engine_android_files":"%s","sdk_env_dir":"%s"}}\n' \
             "$([ "$RC" = "0" ] && echo pass || echo fail)" "$RC" "$SECS" "$FOUND_SETUP" "$FOUND_SDK"
+
+      - name: androidwhy -- ask the engine WHY it refuses Android
+        id: androidwhy
+        if: ${{ steps.secret.outputs.ok == 'yes' && (steps.find.outputs.found == 'yes' || steps.pull.outputs.rc == '0') && inputs.androidwhy }}
+        env:
+          ENG:  ${{ steps.find.outputs.engine || steps.pull.outputs.engine }}
+          PFX:  ${{ steps.pull.outputs.exec }}
+        run: |
+          set +e
+          # WHY THIS STEP EXISTS. Run 33659536622 measured UBT refusing in
+          # 1.11 seconds with "The Android platform is not supported from this
+          # engine distribution." -- while Engine/Platforms/Android and
+          # Engine/Build/Android were BOTH PRESENT. Files present and platform
+          # refused is not "the SDK is missing"; it is a gate somewhere saying
+          # no. This asks WHICH gate, before anyone spends bytes pulling a
+          # bigger image or hours building from source.
+          #
+          # It is the same move that broke the lavapipe wall open: run
+          # 33304835669 READ THE ENGINE'S OWN SOURCE and found
+          # -AllowCPUDevices eight lines above the refusal. A sentence in a
+          # log is a symptom; the line that prints it is a cause.
+          #
+          # NOTHING HERE IS A FIX AND NOTHING HERE IS GUESSED. It reads. If
+          # the answer is "the files really are absent", that is a finding
+          # too, and a different one.
+          echo "=== A. what Android files does this image actually carry ==="
+          for D in "$ENG/Engine/Platforms/Android" "$ENG/Engine/Build/Android"; do
+            if $PFX test -d "$D"; then
+              echo "  $D -- present, top level:"
+              $PFX ls -1 "$D" 2>/dev/null | head -15
+            else
+              echo "  $D -- ABSENT"
+            fi
+          done
+          echo "  --- UBT files whose name mentions Android ---"
+          $PFX find "$ENG/Engine/Binaries/DotNET/UnrealBuildTool" -iname '*ndroid*' 2>/dev/null | head -15
+          echo "  (empty above means none were found, which is itself the answer)"
+
+          echo "=== B. does this engine call itself an INSTALLED build, and which platforms does it allow ==="
+          for F in \
+            "$ENG/Engine/Build/InstalledBuild.txt" \
+            "$ENG/Engine/Config/InstalledPlatform.ini" \
+            "$ENG/Engine/Build/NotForLicensees/InstalledPlatform.ini"
+          do
+            if $PFX test -f "$F"; then
+              echo "  --- $F ---"
+              $PFX cat "$F" 2>/dev/null | head -60
+            else
+              echo "  ABSENT: $F"
+            fi
+          done
+
+          echo "=== C. WHICH FILE PRINTS THE REFUSAL. The sentence is a symptom; this is the cause ==="
+          NEEDLE="is not supported from this engine distribution"
+          echo "  searching UBT C# source, if this image ships any..."
+          $PFX grep -rn --include='*.cs' "$NEEDLE" \
+            "$ENG/Engine/Source/Programs/UnrealBuildTool" 2>/dev/null | head -10
+          echo "  searching the compiled UBT assemblies for the same string..."
+          $PFX grep -rlsa "$NEEDLE" \
+            "$ENG/Engine/Binaries/DotNET/UnrealBuildTool" 2>/dev/null | head -10
+          echo "  (both empty means the sentence comes from somewhere neither"
+          echo "   search reached -- report that, do NOT read it as absent)"
+
+          echo "=== D. UBT's own log from the refusal, if it survived ==="
+          $PFX tail -40 /home/ue4/.config/Epic/UnrealBuildTool/Log.txt 2>/dev/null \
+            || echo "  no UBT log at that path in this container"
+
+          printf '##TBS##{"v":1,"probe":"android_refusal_source","status":"pass","data":{"note":"inventory and source hunt only; nothing was changed and nothing was fixed"}}\n'
 
       - name: Start it on this project
         id: boot
