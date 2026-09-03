@@ -58,6 +58,10 @@ on:
         description: 'ask the engine WHY it refuses Android -- inventory, installed-platform config, and the source of the refusal sentence'
         type: boolean
         default: false
+      androidgate:
+        description: 'read what the installed-build allow-list is, and whether anything is behind it'
+        type: boolean
+        default: false
       render:
         description: 'ask whether this container can render, then render Valiasr offscreen'
         type: boolean
@@ -836,6 +840,94 @@ jobs:
             || echo "  no UBT log at that path in this container"
 
           printf '##TBS##{"v":1,"probe":"android_refusal_source","status":"pass","data":{"note":"inventory and source hunt only; nothing was changed and nothing was fixed"}}\n'
+
+      - name: androidgate -- read the allow-list, and whether anything is behind it
+        id: androidgate
+        if: ${{ steps.secret.outputs.ok == 'yes' && (steps.find.outputs.found == 'yes' || steps.pull.outputs.rc == '0') && inputs.androidgate }}
+        env:
+          ENG:  ${{ steps.find.outputs.engine || steps.pull.outputs.engine }}
+          PFX:  ${{ steps.pull.outputs.exec }}
+        run: |
+          set +e
+          # WHY THIS STEP EXISTS, and what the step above it settled.
+          # Run 33675527664 (`androidwhy`) proved the refusal is NOT a missing
+          # platform: UBT registers `AndroidPlatformFactory`, and only Linux
+          # and LinuxArm64 get a `buildable: True` line. The throw is at
+          # TargetDescriptor.cs:525, during command-line parsing, before any
+          # toolchain lookup -- an installed-build ALLOW-LIST check. This
+          # engine calls itself installed (`InstalledBuild.txt` = `UE_5.8`).
+          #
+          # That run also tested exactly two paths for the allow-list file and
+          # found neither. TWO `test -f` CALLS ARE NOT A SEARCH. So question 1
+          # asks the shipped C# source where that list is actually read from,
+          # rather than guessing a third path.
+          #
+          # AND A GATE OPENING ONTO AN EMPTY ROOM IS STILL A WALL. The same run
+          # saw `Engine/Platforms/Android` holding only `Plugins`, and
+          # `SetupAndroid.sh` was already measured absent. Questions 2 and 3
+          # ask whether the platform's own build code is there at all -- which
+          # decides whether "get past the allow-list" is worth trying or
+          # whether the answer really is a different engine distribution.
+          #
+          # NOTHING HERE WRITES, BUILDS, OR FIXES ANYTHING. It reads.
+          echo "=== 1. WHERE DOES InstalledPlatformInfo READ ITS LIST FROM ==="
+          echo "  --- the class's own source, if this image ships it ---"
+          $PFX find "$ENG/Engine/Source/Programs/UnrealBuildTool" \
+            -iname 'InstalledPlatform*.cs' 2>/dev/null | head -10
+          echo "  (empty means no file by that NAME -- the class may still be"
+          echo "   in another file; question 1b covers that)"
+          echo "  --- 1b. every .cs line mentioning InstalledPlatform ---"
+          $PFX grep -rn --include='*.cs' "InstalledPlatformInfo\|InstalledPlatform.ini" \
+            "$ENG/Engine/Source/Programs/UnrealBuildTool" 2>/dev/null | head -25
+          echo "  --- 1c. the throw at TargetDescriptor.cs:525, in context ---"
+          $PFX sed -n '505,530p' \
+            "$ENG/Engine/Source/Programs/UnrealBuildTool/Configuration/Descriptors/TargetDescriptor.cs" \
+            2>/dev/null
+          echo "  --- 1d. every file anywhere in the engine named InstalledPlatform* ---"
+          $PFX find "$ENG/Engine" -iname 'InstalledPlatform*' 2>/dev/null | head -20
+          echo "  (this is the SEARCH the two test -f calls were not)"
+
+          echo "=== 2. IS ANYTHING BEHIND THE GATE. The Android platform's own build code ==="
+          for D in \
+            "$ENG/Engine/Platforms/Android" \
+            "$ENG/Engine/Platforms/Android/Plugins" \
+            "$ENG/Engine/Build/Android" \
+            "$ENG/Engine/Source/Programs/UnrealBuildTool/Platform/Android"
+          do
+            if $PFX test -d "$D"; then
+              echo "  --- $D -- present:"
+              $PFX ls -1 "$D" 2>/dev/null | head -25
+            else
+              echo "  ABSENT: $D"
+            fi
+          done
+          echo "  --- 2b. how big is the Android platform tree, in files ---"
+          echo -n "  files under Engine/Platforms/Android: "
+          $PFX sh -c "find '$ENG/Engine/Platforms/Android' -type f 2>/dev/null | wc -l"
+          echo -n "  files under Engine/Build/Android:     "
+          $PFX sh -c "find '$ENG/Engine/Build/Android' -type f 2>/dev/null | wc -l"
+          echo "  (a number here is a measurement; a blank line is NOT a zero"
+          echo "   -- if either is blank, report it as unmeasured)"
+
+          echo "=== 3. DOES THE COMPILED UBT CARRY THE ANDROID PLATFORM ==="
+          echo "  --- 3a. UBT assemblies on disk ---"
+          $PFX ls -1 "$ENG/Engine/Binaries/DotNET/UnrealBuildTool" 2>/dev/null | head -20
+          echo "  --- 3b. the factory UBT's own log said it registered ---"
+          echo "  grep is UTF-16-aware here: run 33675527664's ASCII grep found"
+          echo "  nothing in these assemblies while the source grep hit, and a"
+          echo "  .NET literal is UTF-16. THIS TESTS THAT EXPLANATION."
+          for NEEDLE in AndroidPlatformFactory AndroidPlatformSDK; do
+            echo -n "    $NEEDLE -- as ASCII:  "
+            $PFX sh -c "grep -rlsa '$NEEDLE' '$ENG/Engine/Binaries/DotNET/UnrealBuildTool' 2>/dev/null | head -3 | tr '\n' ' '"
+            echo ""
+            echo -n "    $NEEDLE -- as UTF-16: "
+            $PFX sh -c "grep -rlsa -P '$(echo -n $NEEDLE | sed 's/./&\\x00/g')' '$ENG/Engine/Binaries/DotNET/UnrealBuildTool' 2>/dev/null | head -3 | tr '\n' ' '"
+            echo ""
+          done
+          echo "  (if ASCII is empty and UTF-16 is not, the earlier empty grep"
+          echo "   was an instrument artefact and is now explained, not a finding)"
+
+          printf '##TBS##{"v":1,"probe":"android_allow_list","status":"pass","data":{"note":"read-only: allow-list source, platform tree size, and a UTF-16 control on the assembly grep. Nothing was changed."}}\n'
 
       - name: Start it on this project
         id: boot
