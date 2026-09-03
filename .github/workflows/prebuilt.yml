@@ -46,6 +46,10 @@ on:
         description: 'ghcr | mirror -- where the engine image comes from. mirror touches no registry'
         required: false
         default: 'ghcr'
+      engine_tag:
+        description: 'which epicgames/unreal-engine tag to pull. MUST be used with image_from=ghcr -- the mirror on our Release holds dev-slim-5.8.2 and nothing else'
+        required: false
+        default: 'dev-slim-5.8.2'
       mirror:
         description: 'off | roundtrip | ghcrcheck | save | restore | crashmatrix | elf | icd | cvars -- only save touches ghcr'
         required: false
@@ -163,6 +167,67 @@ jobs:
           echo "--- ownership, for the record ---"
           ls -ld /mnt /mnt/dl /home/runner /home/runner/ue 2>&1
 
+      - name: enginetag -- how big is the tag we are about to pull, before pulling it
+        id: enginetag
+        if: ${{ steps.secret.outputs.ok == 'yes' && inputs.source == 'image' && inputs.engine_tag != 'dev-slim-5.8.2' }}
+        env:
+          TOK: ${{ secrets.TBS_PRIVATE_TOKEN }}
+          IMG: ghcr.io/epicgames/unreal-engine:${{ inputs.engine_tag }}
+          BASE: ghcr.io/epicgames/unreal-engine:dev-slim-5.8.2
+        run: |
+          set +e
+          # WHY THIS RUNS BEFORE THE PULL AND NOT AFTER A FAILURE.
+          # `docker manifest inspect` fetches a few KB and not one blob, so
+          # the size is knowable for free. dev-slim-5.8.2 is 22888 MB
+          # compressed and 57.46 GB on disk, against ~115 GB free here. A
+          # non-slim image could simply not fit -- and if it does not, an
+          # ENOSPC halfway through a pull looks exactly like a dozen other
+          # failures. Measuring first means a later "it did not fit" is
+          # attributable instead of guessed.
+          #
+          # IT IS ALSO THE ONLY CHEAP SIDE-BY-SIDE. Run 33046053174 listed 89
+          # tags and every 5.8.2 candidate is one of exactly two shapes, dev
+          # and dev-slim. If their compressed sizes are close, "slim" is not
+          # stripping platform support and a bigger image is unlikely to
+          # carry Android either. That is a hint, NOT the answer: only UBT's
+          # own verdict settles it, and this step does not pretend otherwise.
+          echo "$TOK" | docker login ghcr.io -u Mohammadlali --password-stdin > /tmp/tl.txt 2>&1
+          echo "login rc : $?"
+          for T in "$IMG" "$BASE"; do
+            echo "--- $T ---"
+            docker manifest inspect "$T" > /tmp/mf.json 2>&1
+            MRC=$?
+            echo "  manifest rc : $MRC"
+            if [ $MRC -ne 0 ]; then
+              head -3 /tmp/mf.json
+              echo "  NOT MEASURED for this tag -- no size, and that is not a zero"
+              continue
+            fi
+            # jq, not an inline python heredoc: a heredoc body inside a YAML
+            # block scalar has to carry the block's indentation, and indented
+            # python is a syntax error. This cost one broken parse locally.
+            NL=$(jq -r '(.layers // []) | length' /tmp/mf.json 2>/dev/null)
+            NM=$(jq -r '(.manifests // []) | length' /tmp/mf.json 2>/dev/null)
+            if [ "${NL:-0}" = "0" ] && [ "${NM:-0}" = "0" ]; then
+              # rc was 0 but there are neither layers nor manifests. That is
+              # a shape this step does not understand -- an error body, say.
+              # Printing "0 bytes" here would turn a failure to measure into
+              # a value, which is the mistake this project has made most.
+              echo "  UNMEASURED: manifest parsed but carried no layers and no"
+              echo "  manifests. First line of what came back:"
+              head -1 /tmp/mf.json
+            elif [ "${NL:-0}" = "0" ]; then
+              echo "  multi-arch index, $NM manifests -- per-arch sizes, not summed here"
+            else
+              echo "  layers          : ${NL:-unmeasured}"
+              jq -r '"  compressed total: \((.layers // [] | map(.size) | add) // 0) bytes = \(((.layers // [] | map(.size) | add) // 0) / 1000000 | floor) MB"' \
+                /tmp/mf.json 2>/dev/null || echo "  compressed total: UNMEASURED (jq could not read it)"
+            fi
+          done
+          echo "(a tag that could not be inspected is UNMEASURED. Do not read"
+          echo " a missing number as a small image or an absent tag.)"
+          printf '##TBS##{"v":1,"probe":"engine_tag_size","status":"pass","data":{"note":"manifest metadata only, no blob was fetched"}}\n'
+
       - name: Pull the engine image from ghcr.io
         id: pull
         # `mirror: roundtrip` must cost NO pull -- it exists to settle the
@@ -175,9 +240,23 @@ jobs:
           TOK_ALT: ${{ secrets.TBS_PRIVATE_TOKEN_ALT }}
           ALT_USER: ${{ vars.TBS_ALT_USER }}
           IMAGE_FROM: ${{ inputs.image_from }}
-          IMG: ghcr.io/epicgames/unreal-engine:dev-slim-5.8.2
+          IMG: ghcr.io/epicgames/unreal-engine:${{ inputs.engine_tag || 'dev-slim-5.8.2' }}
         run: |
           set +e
+          # THE TAG IS AN INPUT NOW, AND THE MIRROR IS NOT. Our Release holds
+          # ONE image, dev-slim-5.8.2. Restoring it and then calling it by
+          # another name would find nothing, or worse, find the old image and
+          # report it under the new tag's name -- a measurement attributed to
+          # the wrong distribution, which is this project's most expensive
+          # kind of mistake. So refuse the combination out loud.
+          if [ "$IMAGE_FROM" = "mirror" ] \
+             && [ "$IMG" != "ghcr.io/epicgames/unreal-engine:dev-slim-5.8.2" ]; then
+            echo "REFUSED: image_from=mirror with engine_tag=$IMG."
+            echo "The Release mirror holds dev-slim-5.8.2 only. Use image_from=ghcr"
+            echo "for any other tag. Nothing was pulled and nothing was restored."
+            printf '##TBS##{"v":1,"probe":"engine_tag_guard","status":"fail","data":{"reason":"mirror holds dev-slim-5.8.2 only","asked":"%s"}}\n' "$IMG"
+            exit 1
+          fi
           # WHY THIS REPLACES THE ZIP. Run 33046053174 measured ghcr.io
           # answering 200 for epicgames/unreal-engine and listing 89 tags
           # including dev-slim-5.8.2, whose manifest is 22888 MB compressed
@@ -927,7 +1006,25 @@ jobs:
           echo "  (if ASCII is empty and UTF-16 is not, the earlier empty grep"
           echo "   was an instrument artefact and is now explained, not a finding)"
 
-          printf '##TBS##{"v":1,"probe":"android_allow_list","status":"pass","data":{"note":"read-only: allow-list source, platform tree size, and a UTF-16 control on the assembly grep. Nothing was changed."}}\n'
+          echo "=== 4. THE CONTRADICTION RUN 33722583552 LEFT OPEN ==="
+          # Question 1 found the list is read from an ini section
+          # [InstalledPlatforms], and a find over the WHOLE engine turned up no
+          # file named InstalledPlatform*.ini -- only the .h, .cpp and .cs.
+          # Yet Linux IS valid: our module compiled for it. So either the file
+          # is named something else, or the list has another source, or an
+          # absent list takes a default path. THREE CASES, ONE ANSWER, and the
+          # code that decides is in the file question 1 already named.
+          IPI="$ENG/Engine/Source/Programs/UnrealBuildTool/System/InstalledPlatformInfo.cs"
+          echo "  --- 4a. the static constructor: WHICH ini, and what if it is absent ---"
+          $PFX sed -n '110,175p' "$IPI" 2>/dev/null
+          echo "  --- 4b. IsValid itself: what an empty or absent list returns ---"
+          $PFX grep -n "static bool IsValid\|IsValidPlatform\|InstalledPlatformConfigurations" "$IPI" 2>/dev/null | head -20
+          echo "  --- 4c. the first IsValid body in full ---"
+          $PFX sed -n "$($PFX grep -n 'public static bool IsValid(' "$IPI" 2>/dev/null | head -1 | cut -d: -f1),+40p" "$IPI" 2>/dev/null
+          echo "  (a blank section here is UNMEASURED -- the sed range depends"
+          echo "   on the grep above finding a line, and a miss prints nothing)"
+
+          printf '##TBS##{"v":1,"probe":"android_allow_list","status":"pass","data":{"note":"read-only: allow-list source, platform tree size, a control on the assembly grep, and the code deciding what an absent list means. Nothing was changed."}}\n'
 
       - name: Start it on this project
         id: boot
