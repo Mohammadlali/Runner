@@ -66,6 +66,10 @@ on:
         description: 'read what the installed-build allow-list is, and whether anything is behind it'
         type: boolean
         default: false
+      androidfix:
+        description: 'try four NDK/SDK fixes in sequence for the "Sdk: not found. Required version r27c" refusal, re-measuring UBT after each -- none skipped for an earlier one answering. (d) downloads NDK r27c straight from Google and needs neither sdkmanager nor /usr/local/lib/android'
+        type: boolean
+        default: false
       render:
         description: 'ask whether this container can render, then render Valiasr offscreen'
         type: boolean
@@ -828,8 +832,11 @@ jobs:
           echo "=== 3. THE DECISIVE ONE: ask UBT to build the game for Android ==="
           if ! $PFX test -f "$BUILD"; then
             echo "rc=91" >> "$GITHUB_OUTPUT"
+            echo "secs=0" >> "$GITHUB_OUTPUT"
             echo "NO Build.sh AT $BUILD -- this engine tree has no build tool,"
             echo "so this run says NOTHING about Android. Not a negative result."
+            printf '##TBS##{"v":1,"probe":"android_toolchain_host","status":"fail","data":{"build_rc":91,"secs":0,"engine_android_files":"%s","sdk_env_dir":"%s"}}\n' \
+              "$FOUND_SETUP" "$FOUND_SDK" | tee /tmp/android.digest
             exit 0
           fi
           BEGAN=$(date +%s)
@@ -839,6 +846,7 @@ jobs:
           SECS=$(( $(date +%s) - BEGAN ))
           echo "android build rc=$RC in ${SECS}s"
           echo "rc=$RC" >> "$GITHUB_OUTPUT"
+          echo "secs=$SECS" >> "$GITHUB_OUTPUT"
 
           # UBT's own sentence, hunted for by name. If none of these match, the
           # tail below is what a reader gets, and "no pattern matched" is
@@ -849,8 +857,15 @@ jobs:
           echo "--- last 40 lines of the android build log ---"
           tail -40 /tmp/android.log 2>/dev/null
 
+          # WRITTEN TO A FILE, NOT JUST PRINTED. Issue #41: this line only
+          # ever reached the Actions log, so the report's final template had
+          # no android section at all and an owner reading the report alone
+          # could not tell "ran and failed" from "never ran" -- exactly the
+          # absence-mistaken-for-non-execution failure this project keeps
+          # re-finding. `tee` keeps it visible in the step log too.
           printf '##TBS##{"v":1,"probe":"android_toolchain_host","status":"%s","data":{"build_rc":%s,"secs":%s,"engine_android_files":"%s","sdk_env_dir":"%s"}}\n' \
-            "$([ "$RC" = "0" ] && echo pass || echo fail)" "$RC" "$SECS" "$FOUND_SETUP" "$FOUND_SDK"
+            "$([ "$RC" = "0" ] && echo pass || echo fail)" "$RC" "$SECS" "$FOUND_SETUP" "$FOUND_SDK" \
+            | tee /tmp/android.digest
 
       - name: androidwhy -- ask the engine WHY it refuses Android
         id: androidwhy
@@ -918,7 +933,9 @@ jobs:
           $PFX tail -40 /home/ue4/.config/Epic/UnrealBuildTool/Log.txt 2>/dev/null \
             || echo "  no UBT log at that path in this container"
 
-          printf '##TBS##{"v":1,"probe":"android_refusal_source","status":"pass","data":{"note":"inventory and source hunt only; nothing was changed and nothing was fixed"}}\n'
+          echo "rc=0" >> "$GITHUB_OUTPUT"
+          printf '##TBS##{"v":1,"probe":"android_refusal_source","status":"pass","data":{"note":"inventory and source hunt only; nothing was changed and nothing was fixed"}}\n' \
+            | tee /tmp/androidwhy.digest
 
       - name: androidgate -- read the allow-list, and whether anything is behind it
         id: androidgate
@@ -1024,7 +1041,278 @@ jobs:
           echo "  (a blank section here is UNMEASURED -- the sed range depends"
           echo "   on the grep above finding a line, and a miss prints nothing)"
 
-          printf '##TBS##{"v":1,"probe":"android_allow_list","status":"pass","data":{"note":"read-only: allow-list source, platform tree size, a control on the assembly grep, and the code deciding what an absent list means. Nothing was changed."}}\n'
+          echo "rc=0" >> "$GITHUB_OUTPUT"
+          printf '##TBS##{"v":1,"probe":"android_allow_list","status":"pass","data":{"note":"read-only: allow-list source, platform tree size, a control on the assembly grep, and the code deciding what an absent list means. Nothing was changed."}}\n' \
+            | tee /tmp/androidgate.digest
+
+      - name: androidfix -- try three NDK/SDK fixes in sequence, re-measuring UBT after each
+        id: androidfix
+        if: ${{ steps.secret.outputs.ok == 'yes' && (steps.find.outputs.found == 'yes' || steps.pull.outputs.rc == '0') && inputs.androidfix }}
+        env:
+          ENG:  ${{ steps.find.outputs.engine || steps.pull.outputs.engine }}
+          PFX:  ${{ steps.pull.outputs.exec }}
+        run: |
+          set +e
+          # WHY THIS STEP EXISTS. androidgate settled that the installed-build
+          # allow-list is no longer what refuses Android here (InstalledPlatform*.ini
+          # is absent everywhere and IsValid() returns true for a null list). Run
+          # 33902640451's `android` step got PAST that and UBT's own SDK lookup
+          # failed instead: "SDK validation failed: Sdk: not found. Required
+          # version r27c." That is a different wall, and three candidate fixes
+          # exist that nobody has spent a download+boot on. This step spends
+          # exactly one run on all three, in order.
+          #
+          # ALL THREE RUN, UNCONDITIONALLY. A 37 GB engine and a one-hour
+          # presigned link do not come around often enough to spend one run on
+          # step (a) alone and learn in a LATER run that (b) or (c) was the
+          # real fix. Nothing here short-circuits on an earlier step's rc --
+          # every step's own rc and UBT's own SDK/NDK line are recorded, even
+          # after an earlier step already answered r27c.
+          #
+          # "Make room", earlier in this job, deletes /usr/local/lib/android
+          # UNCONDITIONALLY to fit the 37 GB zip -- so ANDROID_NDK_ROOT may
+          # still be SET as an env var while the directory (and sdkmanager
+          # inside it) is already gone. That is a real candidate answer for
+          # step (a), not a reason to skip measuring it.
+          #
+          # r27c = ndk;27.2.12479018. Not a guess: the issue's own environment
+          # read named ANDROID_NDK_ROOT as .../ndk/27.3.13750724 and called it
+          # r27d, and Google's NDK release numbering increments the middle
+          # component by one letter -- r27, r27b, r27c, r27d map to
+          # 27.0.11718014, 27.1.12297006, 27.2.12479018, 27.3.13750724. The
+          # last of those four is the one the issue measured, which confirms
+          # the other three rather than assumes them.
+          PROJ="$GITHUB_WORKSPACE/work/TehranBlindSpot.uproject"
+          BUILD="$ENG/Engine/Build/BatchFiles/Linux/Build.sh"
+          NEEDLE="sdk|ndk|android.*not|not.*android|platform.*valid|UnrealBuildTool.*Exception"
+
+          if ! $PFX test -f "$BUILD"; then
+            echo "rc_a=91" >> "$GITHUB_OUTPUT"
+            echo "rc_b=91" >> "$GITHUB_OUTPUT"
+            echo "rc_c=91" >> "$GITHUB_OUTPUT"
+            echo "NO Build.sh AT $BUILD -- nothing to re-run three times."
+            echo "This says nothing about any of the three fixes."
+            printf '##TBS##{"v":1,"probe":"android_ndk_fix_attempts","status":"fail","data":{"note":"no Build.sh, nothing attempted"}}\n' \
+              | tee /tmp/androidfix.digest
+            exit 0
+          fi
+
+          run_ubt() {
+            $PFX env NDKROOT="$1" "$BUILD" TehranBlindSpot Android Development \
+              -project="$PROJ" -waitmutex -NoUba > /tmp/androidfix_step.log 2>&1
+            echo $?
+          }
+          # NO NDKROOT OVERRIDE, for (c): SetupAndroid.sh's job is to leave
+          # the SDK/NDK somewhere UBT finds on its own, the same way the
+          # `android` step's own UBT call never set NDKROOT either. Forcing
+          # NDKROOT here would test (a) a second time, not (c).
+          run_ubt_ambient() {
+            $PFX "$BUILD" TehranBlindSpot Android Development \
+              -project="$PROJ" -waitmutex -NoUba > /tmp/androidfix_step.log 2>&1
+            echo $?
+          }
+
+          echo "=== environment before any fix ==="
+          echo "  ANDROID_NDK_ROOT (Runner)  = ${ANDROID_NDK_ROOT:-<unset>}"
+          echo "  NDKROOT          (Runner)  = ${NDKROOT:-<unset>}"
+          echo "  JAVA_HOME        (Runner)  = ${JAVA_HOME:-<unset>}"
+
+          echo ""
+          echo "=== (a) NDKROOT = the Runner's own ANDROID_NDK_ROOT ==="
+          NDK_A="${ANDROID_NDK_ROOT}"
+          echo "  NDKROOT -> ${NDK_A:-<empty -- ANDROID_NDK_ROOT was unset>}"
+          RC_A=$(run_ubt "$NDK_A")
+          MSG_A=$(grep -n -i -E "$NEEDLE" /tmp/androidfix_step.log 2>/dev/null | tail -5)
+          echo "  rc=$RC_A"
+          echo "  --- last SDK/NDK lines UBT printed ---"
+          echo "${MSG_A:-<no line matched the SDK/NDK pattern>}"
+          cp /tmp/androidfix_step.log /tmp/androidfix_a.log 2>/dev/null
+
+          echo ""
+          echo "=== (b) install r27c by exact version via sdkmanager, point NDKROOT at it ==="
+          if $PFX sh -c 'command -v sdkmanager' >/dev/null 2>&1; then
+            SDKM=$($PFX sh -c 'command -v sdkmanager')
+            SDKROOT_B="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+            echo "  sdkmanager found: $SDKM"
+            $PFX sh -c "yes | '$SDKM' --install 'ndk;27.2.12479018' --sdk_root='$SDKROOT_B'" \
+              > /tmp/androidfix_sdkmanager.log 2>&1
+            SDKM_RC=$?
+            echo "  sdkmanager install rc=$SDKM_RC"
+            tail -10 /tmp/androidfix_sdkmanager.log 2>/dev/null
+            NDK_B="$SDKROOT_B/ndk/27.2.12479018"
+          else
+            echo "  sdkmanager NOT FOUND on this route -- not installed, or"
+            echo "  deleted along with /usr/local/lib/android by the Make room"
+            echo "  step. Recording that as the measurement for (b), not a guess."
+            SDKM_RC=127
+            NDK_B=""
+          fi
+          echo "  NDKROOT -> ${NDK_B:-<empty -- nothing to point at>}"
+          RC_B=$(run_ubt "$NDK_B")
+          MSG_B=$(grep -n -i -E "$NEEDLE" /tmp/androidfix_step.log 2>/dev/null | tail -5)
+          echo "  rc=$RC_B"
+          echo "  --- last SDK/NDK lines UBT printed ---"
+          echo "${MSG_B:-<no line matched the SDK/NDK pattern>}"
+          cp /tmp/androidfix_step.log /tmp/androidfix_b.log 2>/dev/null
+
+          echo ""
+          echo "=== (c) Engine/Extras/Android/SetupAndroid.sh ==="
+          SETUP="$ENG/Engine/Extras/Android/SetupAndroid.sh"
+          PFX_IN=$(echo "$PFX" | sed 's/docker exec/docker exec -i/')
+          if $PFX test -f "$SETUP"; then
+            echo "  present: $SETUP"
+            $PFX chmod +x "$SETUP" 2>/dev/null
+            yes | $PFX_IN "$SETUP" > /tmp/androidfix_setup.log 2>&1
+            SETUP_RC=$?
+            echo "  SetupAndroid.sh rc=$SETUP_RC"
+            tail -20 /tmp/androidfix_setup.log 2>/dev/null
+          else
+            echo "  ABSENT: $SETUP -- this route does not ship it."
+            SETUP_RC=127
+          fi
+          RC_C=$(run_ubt_ambient)
+          MSG_C=$(grep -n -i -E "$NEEDLE" /tmp/androidfix_step.log 2>/dev/null | tail -5)
+          echo "  rc=$RC_C"
+          echo "  --- last SDK/NDK lines UBT printed ---"
+          echo "${MSG_C:-<no line matched the SDK/NDK pattern>}"
+          cp /tmp/androidfix_step.log /tmp/androidfix_c.log 2>/dev/null
+
+          echo ""
+          echo "=== SUMMARY, all three, none skipped ==="
+          echo "a) NDKROOT=ANDROID_NDK_ROOT       : ubt_rc=$RC_A"
+          echo "b) sdkmanager exact-version install: sdkmanager_rc=$SDKM_RC ubt_rc=$RC_B"
+          echo "c) Extras/Android/SetupAndroid.sh  : setup_rc=$SETUP_RC ubt_rc=$RC_C"
+          STATUS=fail
+          if [ "$RC_A" = "0" ] || [ "$RC_B" = "0" ] || [ "$RC_C" = "0" ]; then
+            STATUS=pass
+          else
+            echo "ALL THREE FAILED. Verbatim, the last SDK/NDK line from step (c):"
+            echo "${MSG_C:-<none matched -- last 5 lines of the log instead:>}"
+            [ -z "$MSG_C" ] && tail -5 /tmp/androidfix_c.log 2>/dev/null
+          fi
+
+          echo "rc_a=$RC_A"             >> "$GITHUB_OUTPUT"
+          echo "rc_b=$RC_B"             >> "$GITHUB_OUTPUT"
+          echo "rc_c=$RC_C"             >> "$GITHUB_OUTPUT"
+          echo "sdkmanager_rc=$SDKM_RC" >> "$GITHUB_OUTPUT"
+          echo "setup_rc=$SETUP_RC"     >> "$GITHUB_OUTPUT"
+
+          printf '##TBS##{"v":1,"probe":"android_ndk_fix_attempts","status":"%s","data":{"a_ubt_rc":%s,"b_sdkmanager_rc":%s,"b_ubt_rc":%s,"c_setup_rc":%s,"c_ubt_rc":%s}}\n' \
+            "$STATUS" "$RC_A" "$SDKM_RC" "$RC_B" "$SETUP_RC" "$RC_C" \
+            | tee /tmp/androidfix.digest
+
+      # Issue #42, added AFTER (a)-(c) above, which are untouched: if all
+      # three fail for the same reason, that comparison is itself a finding.
+      #
+      # "Make room", earlier in this job, unconditionally deletes
+      # /usr/local/lib/android to fit the 37 GB engine zip, and run
+      # 33902640451 logged that path as "DOES NOT EXIST on the runner". On
+      # the zip route that directory is where the Runner's own
+      # ANDROID_NDK_ROOT and sdkmanager live, so (a) and (b) above may both
+      # be failing for a missing directory, not a version mismatch -- (d)
+      # needs neither: it fetches NDK r27c straight from Google, independent
+      # of anything "Make room" deleted.
+      #
+      # URL AND CHECKSUM, CONFIRMED LIVE AGAINST GOOGLE, NOT FROM MEMORY.
+      # Neither https://developer.android.com/ndk/downloads (lists only the
+      # current LTS, r27d) nor the NDK wiki's Unsupported-Downloads page
+      # (jumps from r27 straight to r28c; r27c was never superseded within
+      # its own series, so it never appears there) names r27c by itself. Two
+      # independent live reads against Google's own servers, not either doc
+      # page, are what this URL and checksum rest on:
+      #   1. An HTTP HEAD against the URL below returned 200 with
+      #      Content-Length 663987688.
+      #   2. Google's sdkmanager manifest itself --
+      #      dl.google.com/android/repository/repository2-3.xml -- lists
+      #      package "ndk;27.2.12479018" (the exact r27c this job's own UBT
+      #      error names, and the same version step (b) above already
+      #      installs by that identifier) with archive url
+      #      "android-ndk-r27c-linux.zip", size 663987688, and
+      #      sha1 090e8083a715fdb1a3e402d0763c388abb03fb4e for host-os linux
+      #      -- matching (1) exactly.
+      - name: "androidfix (d) -- download NDK r27c directly from Google, no sdkmanager needed"
+        id: androidfix_d
+        if: ${{ steps.secret.outputs.ok == 'yes' && (steps.find.outputs.found == 'yes' || steps.pull.outputs.rc == '0') && inputs.androidfix }}
+        env:
+          ENG:  ${{ steps.find.outputs.engine || steps.pull.outputs.engine }}
+          PFX:  ${{ steps.pull.outputs.exec }}
+        run: |
+          set +e
+          PROJ="$GITHUB_WORKSPACE/work/TehranBlindSpot.uproject"
+          BUILD="$ENG/Engine/Build/BatchFiles/Linux/Build.sh"
+          NEEDLE="sdk|ndk|android.*not|not.*android|platform.*valid|UnrealBuildTool.*Exception"
+          NDK_URL="https://dl.google.com/android/repository/android-ndk-r27c-linux.zip"
+          NDK_SHA1="090e8083a715fdb1a3e402d0763c388abb03fb4e"
+          NDK_DIR_D="/tmp/tbs_ndk_r27c"
+
+          if ! $PFX test -f "$BUILD"; then
+            echo "rc_d=91" >> "$GITHUB_OUTPUT"
+            echo "dl_rc_d=91" >> "$GITHUB_OUTPUT"
+            echo "unzip_rc_d=91" >> "$GITHUB_OUTPUT"
+            echo "NO Build.sh AT $BUILD -- nothing to re-run for (d) either."
+            printf '##TBS##{"v":1,"probe":"android_ndk_fix_d","status":"fail","data":{"note":"no Build.sh, nothing attempted"}}\n' \
+              | tee /tmp/androidfix_d.digest
+            exit 0
+          fi
+
+          echo "=== (d) download NDK r27c directly, bypass sdkmanager entirely ==="
+          if ! $PFX sh -c 'command -v curl' >/dev/null 2>&1; then
+            echo "  curl NOT FOUND in this execution context -- cannot attempt (d)."
+            DL_RC=127
+          else
+            $PFX sh -c "rm -rf '$NDK_DIR_D' && mkdir -p '$NDK_DIR_D' && cd '$NDK_DIR_D' && curl -L --fail -sS --max-time 1800 -o ndk.zip '$NDK_URL'" \
+              > /tmp/androidfix_d_dl.log 2>&1
+            DL_RC=$?
+          fi
+          echo "  download rc=$DL_RC"
+          tail -5 /tmp/androidfix_d_dl.log 2>/dev/null
+
+          if [ "$DL_RC" -eq 0 ]; then
+            GOT_SHA1=$($PFX sh -c "sha1sum '$NDK_DIR_D/ndk.zip' 2>/dev/null | cut -d' ' -f1")
+            echo "  sha1sum : ${GOT_SHA1:-<sha1sum unavailable in this execution context>}"
+            if [ -n "$GOT_SHA1" ] && [ "$GOT_SHA1" != "$NDK_SHA1" ]; then
+              echo "  SHA1 MISMATCH -- want $NDK_SHA1, got $GOT_SHA1. Not extracting."
+              DL_RC=99
+            fi
+          fi
+
+          if [ "$DL_RC" -eq 0 ] && $PFX sh -c 'command -v unzip' >/dev/null 2>&1; then
+            $PFX sh -c "cd '$NDK_DIR_D' && unzip -q ndk.zip && rm -f ndk.zip" \
+              > /tmp/androidfix_d_unzip.log 2>&1
+            UNZIP_RC=$?
+          elif [ "$DL_RC" -eq 0 ]; then
+            echo "  unzip NOT FOUND in this execution context -- cannot extract."
+            UNZIP_RC=127
+          else
+            UNZIP_RC=91
+          fi
+          echo "  unzip rc=$UNZIP_RC"
+          tail -5 /tmp/androidfix_d_unzip.log 2>/dev/null
+
+          NDK_D=""
+          if [ "$UNZIP_RC" -eq 0 ]; then
+            NDK_D=$($PFX sh -c "find '$NDK_DIR_D' -maxdepth 1 -type d -name 'android-ndk-r27c*'" | head -1)
+          fi
+          echo "  NDKROOT -> ${NDK_D:-<empty -- download or unzip did not produce it>}"
+
+          $PFX env NDKROOT="$NDK_D" "$BUILD" TehranBlindSpot Android Development \
+            -project="$PROJ" -waitmutex -NoUba > /tmp/androidfix_d_step.log 2>&1
+          RC_D=$?
+          MSG_D=$(grep -n -i -E "$NEEDLE" /tmp/androidfix_d_step.log 2>/dev/null | tail -5)
+          echo "  ubt rc=$RC_D"
+          echo "  --- last SDK/NDK lines UBT printed ---"
+          echo "${MSG_D:-<no line matched the SDK/NDK pattern>}"
+
+          STATUS_D=fail
+          [ "$RC_D" = "0" ] && STATUS_D=pass
+
+          echo "rc_d=$RC_D"           >> "$GITHUB_OUTPUT"
+          echo "dl_rc_d=$DL_RC"       >> "$GITHUB_OUTPUT"
+          echo "unzip_rc_d=$UNZIP_RC" >> "$GITHUB_OUTPUT"
+
+          printf '##TBS##{"v":1,"probe":"android_ndk_fix_d","status":"%s","data":{"dl_rc":%s,"unzip_rc":%s,"ubt_rc":%s}}\n' \
+            "$STATUS_D" "$DL_RC" "$UNZIP_RC" "$RC_D" \
+            | tee /tmp/androidfix_d.digest
 
       - name: Start it on this project
         id: boot
@@ -1093,9 +1381,10 @@ jobs:
 
       - name: Can this container render at all
         id: vk
-        if: ${{ steps.secret.outputs.ok == 'yes' && steps.pull.outputs.rc == '0' && inputs.render }}
+        if: ${{ steps.secret.outputs.ok == 'yes' && (steps.find.outputs.found == 'yes' || steps.pull.outputs.rc == '0') && inputs.render }}
         env:
           PFX: ${{ steps.pull.outputs.exec }}
+          ENG: ${{ steps.find.outputs.engine || steps.pull.outputs.engine }}
         run: |
           set +e
           # THE CHEAP DECISIVE QUESTION, ASKED BEFORE ANYTHING TRIES TO RENDER.
@@ -1117,12 +1406,33 @@ jobs:
           # of a package. mesa-vulkan-drivers provides lavapipe, the SOFTWARE
           # Vulkan driver, and vulkan-tools provides vulkaninfo.
           #
-          # -u 0 FOR THE INSTALL ONLY. apt needs root; Unreal refuses to run
-          # as root and said so in run 33049314055. Those are different
-          # commands and only this one gets root.
-          $PFX true 2>/dev/null && docker exec -u 0 tbsue sh -c \
-            'apt-get update -qq && apt-get install -y -qq mesa-vulkan-drivers vulkan-tools' \
-            > /tmp/vkinstall.txt 2>&1
+          # FOUND 2026-09-04, issue #41: on the zip route $PFX is empty, so
+          # `$PFX true` is a bare `true` -- it ALWAYS succeeds, and the `&&`
+          # then ran `docker exec -u 0 tbsue ...` UNCONDITIONALLY, against a
+          # container that only exists on the image route. Run 33902640451
+          # measured the result: "No such container: tbsue", the install
+          # never happened, and vulkaninfo went on to find a loader the
+          # runner ships by default with no ICD behind it -- rc 81, a
+          # correct measurement of the WRONG machine. The step's own `if:`
+          # masked this further: `steps.pull.outputs.rc == '0'` looks like a
+          # route gate, but GitHub coerces a null (pull skipped, on the zip
+          # route) and the string '0' to the SAME number for comparison, so
+          # the condition was true precisely when it should not have been.
+          # Fixed by branching on the route explicitly, the same way the
+          # `build`/`android`/`boot` steps already do with $PFX.
+          #
+          # -u 0 / sudo FOR THE INSTALL ONLY. apt needs root; Unreal refuses
+          # to run as root and said so in run 33049314055. Those are
+          # different commands and only this one gets root.
+          if [ -n "$PFX" ]; then
+            docker exec -u 0 tbsue sh -c \
+              'apt-get update -qq && apt-get install -y -qq mesa-vulkan-drivers vulkan-tools' \
+              > /tmp/vkinstall.txt 2>&1
+          else
+            echo "zip route: installing the driver directly on the Runner, not in a container."
+            sudo apt-get update -qq > /tmp/vkinstall.txt 2>&1
+            sudo apt-get install -y -qq mesa-vulkan-drivers vulkan-tools >> /tmp/vkinstall.txt 2>&1
+          fi
           echo "driver install rc=$? (see the tail below if it is non-zero)"
           tail -3 /tmp/vkinstall.txt 2>/dev/null
           LOADER=$($PFX sh -c 'ls /usr/lib/x86_64-linux-gnu/libvulkan.so.1 2>/dev/null | head -1')
@@ -1183,18 +1493,30 @@ jobs:
           # The report step copies these in after it chowns back.
           VPF="$RUNNER_TEMP/vp_ue_vulkan_sm5.txt"
           VKF="$RUNNER_TEMP/lavapipe_vulkaninfo.txt"
+          # ROOT: the engine tree these two dumps search. On the image route
+          # that is the fixed container path this project has always used;
+          # on the zip route it is wherever the zip unpacked to ($ENG), read
+          # directly off the Runner because $PFX is empty there and there is
+          # no container to exec into. Added 2026-09-04, issue #41, alongside
+          # the driver-install fix above -- before this, every search below
+          # named the container path even on the zip route and found nothing.
+          if [ -n "$PFX" ]; then
+            ROOT="/home/ue4/UnrealEngine/Engine"
+          else
+            ROOT="$ENG/Engine"
+          fi
           # NO EXTENSION FILTER. Run 33160904128 searched --include=*.json and
           # answered "<not found>": VP_UE_Vulkan_SM5 is NOT a json in the
           # tree. Vulkan profiles are commonly GENERATED INTO A C++ HEADER,
           # so the search takes any file type and reports every hit, because
           # where it lives is itself the finding.
-          $PFX sh -c 'grep -rl "VP_UE_Vulkan_SM5" /home/ue4/UnrealEngine/Engine 2>/dev/null | head -20' \
+          $PFX sh -c "grep -rl 'VP_UE_Vulkan_SM5' $ROOT 2>/dev/null | head -20" \
             > /tmp/profhits.txt 2>/dev/null
           HITS=$(grep -c . /tmp/profhits.txt 2>/dev/null)
           echo "--- files naming VP_UE_Vulkan_SM5 (${HITS:-0}) ---"
           cat /tmp/profhits.txt 2>/dev/null
           {
-            echo "search  : grep -rl VP_UE_Vulkan_SM5 /home/ue4/UnrealEngine/Engine"
+            echo "search  : grep -rl VP_UE_Vulkan_SM5 $ROOT"
             echo "run     : ${GITHUB_RUN_ID}"
             echo "hits    : ${HITS:-0}"
             echo "--- every file that named it ---"
@@ -1264,7 +1586,7 @@ jobs:
             echo ""
             echo "== A. every source file carrying the refusal message =="
           } > "$DGF"
-          $PFX sh -c 'grep -rn "meet all the criteria" /home/ue4/UnrealEngine/Engine/Source 2>/dev/null | head -10' \
+          $PFX sh -c "grep -rn 'meet all the criteria' $ROOT/Source 2>/dev/null | head -10" \
             >> "$DGF" 2>&1
           {
             echo ""
@@ -1274,19 +1596,37 @@ jobs:
             echo " so the tree is listed first.)"
             echo "--- does the source tree exist at all ---"
           } >> "$DGF"
-          $PFX sh -c 'ls -d /home/ue4/UnrealEngine/Engine/Source/Runtime/VulkanRHI 2>&1; ls /home/ue4/UnrealEngine/Engine/Source/Runtime/VulkanRHI/Private 2>&1 | head -20' \
+          $PFX sh -c "ls -d $ROOT/Source/Runtime/VulkanRHI 2>&1; ls $ROOT/Source/Runtime/VulkanRHI/Private 2>&1 | head -20" \
             >> "$DGF" 2>&1
           {
             echo "--- lines naming the profile check or device selection ---"
           } >> "$DGF"
-          $PFX sh -c 'grep -rn "vpGetPhysicalDeviceProfileSupport\|GetPhysicalDeviceProfileSupport\|meet all the criteria\|SupportsProfile\|IsDeviceSuitable" /home/ue4/UnrealEngine/Engine/Source/Runtime/VulkanRHI 2>/dev/null | head -30' \
+          $PFX sh -c "grep -rn 'vpGetPhysicalDeviceProfileSupport\|GetPhysicalDeviceProfileSupport\|meet all the criteria\|SupportsProfile\|IsDeviceSuitable' $ROOT/Source/Runtime/VulkanRHI 2>/dev/null | head -30" \
             >> "$DGF" 2>&1
           {
             echo ""
             echo "== A3. 160 lines around the first hit, whichever file it is =="
           } >> "$DGF"
-          $PFX sh -c 'F=$(grep -rl "meet all the criteria" /home/ue4/UnrealEngine/Engine/Source 2>/dev/null | head -1); if [ -n "$F" ]; then echo "file: $F"; N=$(grep -n "meet all the criteria" "$F" | head -1 | cut -d: -f1); A=$((N-120)); [ $A -lt 1 ] && A=1; sed -n "${A},$((N+40))p" "$F"; else echo "(no source file carries that string -- it may live only in a compiled binary, which is itself the finding)"; fi' \
-            >> "$DGF" 2>&1
+          # KEPT AS TWO SEPARATE BRANCHES, NOT ONE $ROOT-ified STRING: this one
+          # has its own inner shell variables ($F, $N, $A) that must NOT be
+          # touched by the outer bash that expands $ROOT elsewhere in this
+          # step. The image branch is byte-for-byte the original, untouched;
+          # the zip branch is the same logic written as plain outer bash,
+          # since $PFX is empty there and sh -c buys nothing.
+          if [ -n "$PFX" ]; then
+            $PFX sh -c 'F=$(grep -rl "meet all the criteria" /home/ue4/UnrealEngine/Engine/Source 2>/dev/null | head -1); if [ -n "$F" ]; then echo "file: $F"; N=$(grep -n "meet all the criteria" "$F" | head -1 | cut -d: -f1); A=$((N-120)); [ $A -lt 1 ] && A=1; sed -n "${A},$((N+40))p" "$F"; else echo "(no source file carries that string -- it may live only in a compiled binary, which is itself the finding)"; fi' \
+              >> "$DGF" 2>&1
+          else
+            F=$(grep -rl "meet all the criteria" "$ROOT/Source" 2>/dev/null | head -1)
+            if [ -n "$F" ]; then
+              echo "file: $F" >> "$DGF"
+              N=$(grep -n "meet all the criteria" "$F" | head -1 | cut -d: -f1)
+              A=$((N-120)); [ "$A" -lt 1 ] && A=1
+              sed -n "${A},$((N+40))p" "$F" >> "$DGF" 2>&1
+            else
+              echo "(no source file carries that string -- it may live only in a compiled binary, which is itself the finding)" >> "$DGF"
+            fi
+          fi
           {
             echo ""
             echo "== B. the device through the ENGINE'S OWN bundled loader =="
@@ -1297,12 +1637,12 @@ jobs:
             echo "the loader out, which is worth as much."
             echo "--- engine Vulkan directory ---"
           } >> "$DGF"
-          $PFX sh -c 'ls -l /home/ue4/UnrealEngine/Engine/Binaries/ThirdParty/Vulkan/Linux 2>&1 | head -20' \
+          $PFX sh -c "ls -l $ROOT/Binaries/ThirdParty/Vulkan/Linux 2>&1 | head -20" \
             >> "$DGF" 2>&1
           {
             echo "--- vulkaninfo through it ---"
           } >> "$DGF"
-          $PFX sh -c 'LD_LIBRARY_PATH=/home/ue4/UnrealEngine/Engine/Binaries/ThirdParty/Vulkan/Linux:$LD_LIBRARY_PATH vulkaninfo 2>&1 | head -200' \
+          $PFX sh -c "LD_LIBRARY_PATH=$ROOT/Binaries/ThirdParty/Vulkan/Linux:\$LD_LIBRARY_PATH vulkaninfo 2>&1 | head -200" \
             >> "$DGF" 2>&1
           echo "criteria file bytes : $(wc -c < "$DGF" 2>/dev/null)"
           # ------------------------------------------------------------------
@@ -2237,6 +2577,18 @@ jobs:
           C_RC:    ${{ steps.build.outputs.rc }}
           C_SECS:  ${{ steps.build.outputs.secs }}
           C_SO:    ${{ steps.build.outputs.so }}
+          AND_RC:   ${{ steps.android.outputs.rc }}
+          AND_SECS: ${{ steps.android.outputs.secs }}
+          ANDW_RC:  ${{ steps.androidwhy.outputs.rc }}
+          ANDG_RC:  ${{ steps.androidgate.outputs.rc }}
+          ANDFX_RC_A:  ${{ steps.androidfix.outputs.rc_a }}
+          ANDFX_RC_B:  ${{ steps.androidfix.outputs.rc_b }}
+          ANDFX_RC_C:  ${{ steps.androidfix.outputs.rc_c }}
+          ANDFX_SDKM:  ${{ steps.androidfix.outputs.sdkmanager_rc }}
+          ANDFX_SETUP: ${{ steps.androidfix.outputs.setup_rc }}
+          ANDFX_RC_D:      ${{ steps.androidfix_d.outputs.rc_d }}
+          ANDFX_DL_RC_D:   ${{ steps.androidfix_d.outputs.dl_rc_d }}
+          ANDFX_UNZIP_RC_D: ${{ steps.androidfix_d.outputs.unzip_rc_d }}
           B_RC:    ${{ steps.boot.outputs.rc }}
           B_SECS:  ${{ steps.boot.outputs.secs }}
           B_TBS:   ${{ steps.boot.outputs.tbs }}
@@ -2338,6 +2690,52 @@ jobs:
             head -30 /tmp/build.log 2>/dev/null || echo "(none)"
             echo "--- last 40 lines of the build log ---"
             tail -40 /tmp/build.log 2>/dev/null || echo "(none)"
+            echo ""
+            echo "== android, does this engine image have an Android toolchain =="
+            echo "rc         : ${AND_RC:-<step did not run>}"
+            echo "seconds    : ${AND_SECS:-<none>}"
+            echo "  rc 91 means the engine tree has no Build.sh -- not a missing"
+            echo "  SDK/NDK. Any other non-zero rc is UBT's own, from the pattern"
+            echo "  grep and log tail printed by the step itself (Actions log"
+            echo "  only; not duplicated here to keep this file small)."
+            echo "--- ##TBS## line the android step produced ---"
+            cat /tmp/android.digest 2>/dev/null || echo "(none)"
+            echo ""
+            echo "== androidwhy, why the engine refuses Android =="
+            echo "rc         : ${ANDW_RC:-<step did not run>}"
+            echo "  Read-only inventory: allow-list files, InstalledPlatform.ini"
+            echo "  presence, and where the refusal sentence is sourced from."
+            echo "  rc 0 means the step ran to completion, not that Android is"
+            echo "  supported -- see the step's own Actions log for the findings."
+            echo "--- ##TBS## line the androidwhy step produced ---"
+            cat /tmp/androidwhy.digest 2>/dev/null || echo "(none)"
+            echo ""
+            echo "== androidgate, the installed-build allow-list and what is behind it =="
+            echo "rc         : ${ANDG_RC:-<step did not run>}"
+            echo "  Read-only inventory: where InstalledPlatformInfo reads its"
+            echo "  list from, whether the Android platform's own build code is"
+            echo "  present, and what an absent list resolves to. rc 0 means the"
+            echo "  step ran, not that Android is unlocked -- see the step's own"
+            echo "  Actions log for the findings."
+            echo "--- ##TBS## line the androidgate step produced ---"
+            cat /tmp/androidgate.digest 2>/dev/null || echo "(none)"
+            echo ""
+            echo "== androidfix, four NDK/SDK fixes for the r27c refusal, none skipped =="
+            echo "(a) NDKROOT=ANDROID_NDK_ROOT        ubt rc : ${ANDFX_RC_A:-<step did not run>}"
+            echo "(b) sdkmanager install rc / ubt rc         : ${ANDFX_SDKM:-<step did not run>} / ${ANDFX_RC_B:-<step did not run>}"
+            echo "(c) SetupAndroid.sh rc / ubt rc            : ${ANDFX_SETUP:-<step did not run>} / ${ANDFX_RC_C:-<step did not run>}"
+            echo "(d) download rc / unzip rc / ubt rc        : ${ANDFX_DL_RC_D:-<step did not run>} / ${ANDFX_UNZIP_RC_D:-<step did not run>} / ${ANDFX_RC_D:-<step did not run>}"
+            echo "  rc 91 on all four means there was no Build.sh to re-run, not"
+            echo "  that the fixes failed. rc 127 for the sdkmanager, setup, curl or"
+            echo "  unzip rc means the tool was not found on this route -- read as"
+            echo "  absent, not as a fix that was tried and lost. (d) needs neither"
+            echo "  sdkmanager nor /usr/local/lib/android -- it downloads NDK r27c"
+            echo "  straight from Google, so if (a)-(c) fail the same way and (d)"
+            echo "  also fails, that rules out the deleted-directory hypothesis."
+            echo "--- ##TBS## line the androidfix step produced (a/b/c) ---"
+            cat /tmp/androidfix.digest 2>/dev/null || echo "(none)"
+            echo "--- ##TBS## line the androidfix (d) step produced ---"
+            cat /tmp/androidfix_d.digest 2>/dev/null || echo "(none)"
             echo ""
             echo "== boot, -NullRHI, running Tools/probe_boot.py =="
             echo "rc         : ${B_RC:-<step did not run>}"
