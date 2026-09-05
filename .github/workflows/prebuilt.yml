@@ -67,7 +67,7 @@ on:
         type: boolean
         default: false
       androidfix:
-        description: 'try five NDK/SDK fixes in sequence for the "Sdk: not found. Required version r27c" refusal, re-measuring UBT after each -- none skipped for an earlier one answering. (d) downloads NDK r27c straight from Google and needs neither sdkmanager nor /usr/local/lib/android. (e) puts back the licenses the Make room step deleted and re-runs (d)''s exact command'
+        description: 'try six NDK/SDK fixes in sequence for the "Sdk: not found. Required version r27c" refusal, re-measuring UBT after each -- none skipped for an earlier one answering. (d) downloads NDK r27c straight from Google and needs neither sdkmanager nor /usr/local/lib/android. (e) puts back the licenses the Make room step deleted and re-runs (d)''s exact command. (f) re-runs the same command with /usr/local/lib/android kept whole, when Make room had enough free space to keep it'
         type: boolean
         default: false
       render:
@@ -166,9 +166,41 @@ jobs:
           LIC_N=$(ls -1 "$LIC_BAK" 2>/dev/null | wc -l)
           echo "licenses_backed_up=$LIC_N" >> "$GITHUB_OUTPUT"
           echo "licenses copy rc=$LIC_CP, files kept=$LIC_N"
-          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+
+          # THE SIZE NOBODY HAS EVER MEASURED. Every Android wall so far has
+          # been this rm -rf: wall 3 was the licenses directory it deleted,
+          # wall 4 is the build-tools directory it deleted. Whether the SDK
+          # can simply be KEPT depends on one number that has never been
+          # taken, and a guess here costs an hour-long ENOSPC halfway
+          # through the unpack. Per-subdirectory, so a later run can be
+          # surgical (ndk/ is dead weight -- step (d) downloads r27c itself)
+          # instead of all-or-nothing.
+          echo "--- size of the Android SDK, per subdirectory, before anything is deleted ---"
+          sudo du -sh /usr/local/lib/android/sdk/* 2>/dev/null | sort -h | tail -20
+          ANDROID_KB=$(sudo du -sk /usr/local/lib/android 2>/dev/null | cut -f1)
+          echo "android_kb=${ANDROID_KB:-0}" >> "$GITHUB_OUTPUT"
+          echo "android sdk total: ${ANDROID_KB:-<du failed>} KB"
+
+          sudo rm -rf /usr/share/dotnet /opt/ghc \
                       /usr/local/share/boost /usr/local/.ghcup \
                       /usr/share/swift /opt/hostedtoolcache 2>/dev/null
+
+          # KEEP THE SDK IF THE NUMBERS ALLOW. Peak need on this ONE
+          # filesystem is the 37 GB zip plus the ~57 GB it unpacks to, and
+          # the zip is deleted the moment extraction succeeds. 100 GB is
+          # that peak with a margin. If keeping the SDK would drop free
+          # space under it, the SDK goes and this says so IN THE REPORT --
+          # a silent deletion is what produced walls 3 and 4.
+          FREE_NOW=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+          if [ "${FREE_NOW:-0}" -lt 100 ]; then
+            echo "free ${FREE_NOW} GB < 100 GB needed -- deleting the Android SDK after all"
+            sudo rm -rf /usr/local/lib/android
+            echo "android_kept=no" >> "$GITHUB_OUTPUT"
+          else
+            echo "free ${FREE_NOW} GB -- KEEPING /usr/local/lib/android"
+            echo "android_kept=yes" >> "$GITHUB_OUTPUT"
+          fi
+
           # TWO filesystems, and only one of them has ever been measured.
           # / was 116 GB free after this cleanup; /mnt was never looked at,
           # and run 33024091160 wrote the zip there anyway.
@@ -1439,6 +1471,75 @@ jobs:
           printf '##TBS##{"v":1,"probe":"android_ndk_fix_e","status":"%s","data":{"licenses_restored":%s,"ubt_rc":%s}}\n' \
             "$STATUS_E" "${LIC_SEEN:-0}" "$RC_E" \
             | tee /tmp/androidfix_e.digest
+
+      - name: "androidfix (f) -- with the SDK kept, re-run the SAME UBT command"
+        id: androidfix_f
+        if: ${{ steps.secret.outputs.ok == 'yes' && (steps.find.outputs.found == 'yes' || steps.pull.outputs.rc == '0') && inputs.androidfix }}
+        env:
+          ENG:  ${{ steps.find.outputs.engine || steps.pull.outputs.engine }}
+          PFX:  ${{ steps.pull.outputs.exec }}
+          KEPT: ${{ steps.room.outputs.android_kept }}
+        run: |
+          set +e
+          PROJ="$GITHUB_WORKSPACE/work/TehranBlindSpot.uproject"
+          BUILD="$ENG/Engine/Build/BatchFiles/Linux/Build.sh"
+          NEEDLE="sdk|ndk|licen|android.*not|not.*android|platform.*valid|UnrealBuildTool.*Exception"
+          NDK_DIR_D=/tmp/tbs_ndk_r27c
+
+          # THIS IS AN ANSWER, NOT A FAILURE. If "Make room" deleted the SDK
+          # because free space would have dropped under the 100 GB margin,
+          # there is nothing kept to re-test here, and pretending otherwise
+          # would silently re-run a command that (a)/(b)/(c) already ran
+          # against no SDK.
+          if [ "${KEPT:-}" != "yes" ]; then
+            echo "Make room did not keep the Android SDK (android_kept=${KEPT:-<unset>})."
+            echo "-- SDK was deleted for lack of free space; nothing to re-test for (f)."
+            echo "rc_f=93" >> "$GITHUB_OUTPUT"
+            printf '##TBS##{"v":1,"probe":"android_ndk_fix_f","status":"unmeasured","data":{"reason":"sdk not kept, insufficient free space"}}\n' \
+              | tee /tmp/androidfix_f.digest
+            exit 0
+          fi
+
+          if ! $PFX test -f "$BUILD"; then
+            echo "rc_f=91" >> "$GITHUB_OUTPUT"
+            echo "NO Build.sh AT $BUILD -- nothing to re-run for (f) either."
+            printf '##TBS##{"v":1,"probe":"android_ndk_fix_f","status":"fail","data":{"note":"no Build.sh, nothing attempted"}}\n' \
+              | tee /tmp/androidfix_f.digest
+            exit 0
+          fi
+
+          # READ IT BACK. The SDK was reported "kept" by Make room; this
+          # proves build-tools and platforms are actually still on disk
+          # rather than trusting the decision that skipped the rm -rf.
+          echo "=== (f) SDK directories present after being kept ==="
+          ls -la /usr/local/lib/android/sdk 2>&1 | head -20
+          SDK_DIRS=$(ls -1 /usr/local/lib/android/sdk 2>/dev/null | tr '\n' ',' | sed 's/,$//')
+          echo "sdk_dirs_f=${SDK_DIRS:-<none>}" >> "$GITHUB_OUTPUT"
+
+          NDK_F=$($PFX sh -c "find '$NDK_DIR_D' -maxdepth 1 -type d -name 'android-ndk-r27c*'" | head -1)
+          echo "  NDKROOT -> ${NDK_F:-<empty -- step (d) did not leave an NDK here>}"
+
+          # THE COMMAND IS BYTE-IDENTICAL TO (d) AND (e)'s. The only variable
+          # this step changes is that /usr/local/lib/android was never
+          # deleted, so a changed message is attributable to that alone.
+          $PFX env NDKROOT="$NDK_F" "$BUILD" TehranBlindSpot Android Development \
+            -project="$PROJ" -waitmutex -NoUba > /tmp/androidfix_f_step.log 2>&1
+          RC_F=$?
+          MSG_F=$(grep -n -i -E "$NEEDLE" /tmp/androidfix_f_step.log 2>/dev/null | tail -5)
+          echo "  ubt rc=$RC_F"
+          echo "  --- last SDK/NDK/licence lines UBT printed ---"
+          echo "${MSG_F:-<no line matched the SDK/NDK pattern>}"
+
+          STATUS_F=fail
+          [ "$RC_F" = "0" ] && STATUS_F=pass
+
+          echo "rc_f=$RC_F" >> "$GITHUB_OUTPUT"
+          LAST_F=$(printf '%s\n' "$MSG_F" | tail -1 | tr -d '\r' | cut -c1-300)
+          echo "msg_f=${LAST_F:-<no line matched>}" >> "$GITHUB_OUTPUT"
+
+          printf '##TBS##{"v":1,"probe":"android_ndk_fix_f","status":"%s","data":{"sdk_dirs":"%s","ubt_rc":%s}}\n' \
+            "$STATUS_F" "${SDK_DIRS:-}" "$RC_F" \
+            | tee /tmp/androidfix_f.digest
 
       - name: Start it on this project
         id: boot
@@ -2722,7 +2823,12 @@ jobs:
           ANDFX_RC_E:  ${{ steps.androidfix_e.outputs.rc_e }}
           ANDFX_LIC_E: ${{ steps.androidfix_e.outputs.lic_e }}
           ANDFX_MSG_E: ${{ steps.androidfix_e.outputs.msg_e }}
+          ANDFX_RC_F:      ${{ steps.androidfix_f.outputs.rc_f }}
+          ANDFX_SDK_DIRS_F: ${{ steps.androidfix_f.outputs.sdk_dirs_f }}
+          ANDFX_MSG_F: ${{ steps.androidfix_f.outputs.msg_f }}
           ROOM_LIC:    ${{ steps.room.outputs.licenses_backed_up }}
+          ROOM_KB:     ${{ steps.room.outputs.android_kb }}
+          ROOM_KEPT:   ${{ steps.room.outputs.android_kept }}
           B_RC:    ${{ steps.boot.outputs.rc }}
           B_SECS:  ${{ steps.boot.outputs.secs }}
           B_TBS:   ${{ steps.boot.outputs.tbs }}
@@ -2854,7 +2960,7 @@ jobs:
             echo "--- ##TBS## line the androidgate step produced ---"
             cat /tmp/androidgate.digest 2>/dev/null || echo "(none)"
             echo ""
-            echo "== androidfix, five NDK/SDK fixes for the r27c refusal, none skipped =="
+            echo "== androidfix, six NDK/SDK fixes for the r27c refusal, none skipped =="
             echo "(a) NDKROOT=ANDROID_NDK_ROOT        ubt rc : ${ANDFX_RC_A:-<step did not run>}"
             echo "    UBT said : ${ANDFX_MSG_A:-<step did not run>}"
             echo "(b) sdkmanager install rc / ubt rc         : ${ANDFX_SDKM:-<step did not run>} / ${ANDFX_RC_B:-<step did not run>}"
@@ -2863,7 +2969,7 @@ jobs:
             echo "    UBT said : ${ANDFX_MSG_C:-<step did not run>}"
             echo "(d) download rc / unzip rc / ubt rc        : ${ANDFX_DL_RC_D:-<step did not run>} / ${ANDFX_UNZIP_RC_D:-<step did not run>} / ${ANDFX_RC_D:-<step did not run>}"
             echo "    UBT said : ${ANDFX_MSG_D:-<step did not run>}"
-            echo "  rc 91 on all five means there was no Build.sh to re-run, not"
+            echo "  rc 91 on all six means there was no Build.sh to re-run, not"
             echo "  that the fixes failed. rc 127 for the sdkmanager, setup, curl or"
             echo "  unzip rc means the tool was not found on this route -- read as"
             echo "  absent, not as a fix that was tried and lost. (d) needs neither"
@@ -2876,12 +2982,22 @@ jobs:
             echo "  rc 92 on (e) means there was nothing to restore -- the image"
             echo "  shipped no accepted licenses. That is an ANSWER, not a failure"
             echo "  to try: it rules out the deleted-directory hypothesis for wall 3."
+            echo "(f) sdk dirs kept / ubt rc                 : ${ANDFX_SDK_DIRS_F:-<step did not run>} / ${ANDFX_RC_F:-<step did not run>}"
+            echo "    UBT said : ${ANDFX_MSG_F:-<step did not run>}"
+            echo "  android sdk kept / total KB : ${ROOM_KEPT:-<step did not run>} / ${ROOM_KB:-<step did not run>}"
+            echo "  rc 93 on (f) means Make room deleted the SDK for lack of free"
+            echo "  space -- an answer, not a failure to try. wall 4 was UBT unable"
+            echo "  to find /usr/local/lib/android/sdk/build-tools, which the Make"
+            echo "  room rm -rf deleted along with everything else under android/;"
+            echo "  (f) re-runs the identical command with that directory intact."
             echo "--- ##TBS## line the androidfix step produced (a/b/c) ---"
             cat /tmp/androidfix.digest 2>/dev/null || echo "(none)"
             echo "--- ##TBS## line the androidfix (d) step produced ---"
             cat /tmp/androidfix_d.digest 2>/dev/null || echo "(none)"
             echo "--- ##TBS## line the androidfix (e) step produced ---"
             cat /tmp/androidfix_e.digest 2>/dev/null || echo "(none)"
+            echo "--- ##TBS## line the androidfix (f) step produced ---"
+            cat /tmp/androidfix_f.digest 2>/dev/null || echo "(none)"
             echo ""
             echo "== boot, -NullRHI, running Tools/probe_boot.py =="
             echo "rc         : ${B_RC:-<step did not run>}"
@@ -2974,8 +3090,31 @@ jobs:
               echo "THE EDITOR STARTS ON A GITHUB RUNNER AND OUR PROBE RAN"
               echo "INSIDE IT: ${B_TBS} ##TBS## lines, printed above. First"
               echo "time in this project that Unreal has run anywhere but the"
-              echo "laptop. This says nothing about RENDERING: the run was"
-              echo "-NullRHI, and there is no GPU on this machine."
+              echo "laptop."
+              # READ FROM THIS RUN'S OWN MEASUREMENTS, NOT A FIXED SENTENCE.
+              # This line used to say unconditionally "This says nothing
+              # about RENDERING: the run was -NullRHI, and there is no GPU
+              # on this machine" -- a sentence written before the render
+              # step (above, "== render, -RenderOffScreen ==") ever worked,
+              # and left in place after it started passing. A VERDICT that
+              # cannot change when the run changes is not a verdict.
+              if [ -n "${R_RC:-}" ] && [ "${R_RC}" = "0" ] && [ "${R_PNGS:-0}" -gt 0 ] 2>/dev/null; then
+                echo "RENDERING IS ALSO MEASURED HERE, not assumed: the render"
+                echo "step above exited rc ${R_RC} and wrote ${R_PNGS} PNG file(s)"
+                echo "in ${R_SECS:-<unknown>} seconds. That is SOFTWARE rendering"
+                echo "-- ${V_CPU:-lavapipe}, from the Vulkan check above -- not a"
+                echo "GPU: this machine still has none (hardware GPU dev:"
+                echo "${V_GPU:-<none>})."
+              elif [ -n "${R_RC:-}" ]; then
+                echo "RENDERING WAS ATTEMPTED AND DID NOT PRODUCE A PNG: rc"
+                echo "${R_RC}, ${R_PNGS:-0} PNG file(s). See the render section"
+                echo "above for its own log tail before assuming the boot"
+                echo "result above extends to rendering."
+              else
+                echo "This says nothing about RENDERING: the render step did"
+                echo "not run this time (inputs.render was not set), and the"
+                echo "boot above was -NullRHI, which cannot render at all."
+              fi
             elif [ "${B_RC}" = "0" ]; then
               echo "THE EDITOR STARTED AND EXITED 0, AND NOTHING PROVES OUR"
               echo "PROBE RAN INSIDE IT: zero ##TBS## lines. The editor"
