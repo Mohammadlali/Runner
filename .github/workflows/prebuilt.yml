@@ -74,6 +74,10 @@ on:
         description: 'ask whether this container can render, then render Valiasr offscreen'
         type: boolean
         default: true
+      lights:
+        description: 'issue #50 -- run diag_district_lights.py on the runner under the same -RenderOffScreen as render, and report each lights midtone contribution next to the laptop numbers from CLAUDE.md, to tell apart lavapipe tonemapping from unlit geometry for the district_shots stencil failure'
+        type: boolean
+        default: false
       commit:
         description: 'push the report to the private repo'
         type: boolean
@@ -167,38 +171,80 @@ jobs:
           echo "licenses_backed_up=$LIC_N" >> "$GITHUB_OUTPUT"
           echo "licenses copy rc=$LIC_CP, files kept=$LIC_N"
 
-          # THE SIZE NOBODY HAS EVER MEASURED. Every Android wall so far has
-          # been this rm -rf: wall 3 was the licenses directory it deleted,
-          # wall 4 is the build-tools directory it deleted. Whether the SDK
-          # can simply be KEPT depends on one number that has never been
-          # taken, and a guess here costs an hour-long ENOSPC halfway
-          # through the unpack. Per-subdirectory, so a later run can be
-          # surgical (ndk/ is dead weight -- step (d) downloads r27c itself)
-          # instead of all-or-nothing.
+          # THE SIZE NOBODY HAS EVER MEASURED, until run 33968064489's own
+          # `du -sh` broke it down per subdirectory:
+          #   licenses    8.0K   platform-tools  22M   cmdline-tools 148M
+          #   cmake     170M   build-tools     892M  <- wall 4 wants this
+          #   extras    723M   platforms       2.7G
+          #   ndk       6.5G   <- dead weight: step (d) downloads r27c itself
+          # total 11506044 KB. Keeping the WHOLE ~11 GB SDK never fits (issue
+          # #51: run 33968064489 kept it, `104 >= 100` passed the old guard,
+          # and unzip died mid-extraction with rc 50, ENOSPC). So this is a
+          # SUBSET, not all-or-nothing.
           echo "--- size of the Android SDK, per subdirectory, before anything is deleted ---"
           sudo du -sh /usr/local/lib/android/sdk/* 2>/dev/null | sort -h | tail -20
           ANDROID_KB=$(sudo du -sk /usr/local/lib/android 2>/dev/null | cut -f1)
           echo "android_kb=${ANDROID_KB:-0}" >> "$GITHUB_OUTPUT"
-          echo "android sdk total: ${ANDROID_KB:-<du failed>} KB"
+          echo "android sdk total before any deletion: ${ANDROID_KB:-<du failed>} KB"
+
+          # DROP the ~10.1 GB nobody asked for (ndk, platforms, extras, cmake)
+          # and KEEP the ~914 MB the android walls actually named (licenses,
+          # build-tools, platform-tools, cmdline-tools). Anything else found
+          # under sdk/ is neither asked for nor known, so it is deleted too
+          # and NAMED in the log -- an unknown directory that stays silent is
+          # exactly what would eat the margin next.
+          #
+          # `platforms` IS DELIBERATELY IN THE DROP LIST even though it is not
+          # dead weight the way ndk is: 2.7 GB against a 4 GB margin is too
+          # much to gamble twice, and the one SUCCESSFUL run (33964894709)
+          # still only had 6 GB to spare. If UBT names `platforms` as missing
+          # after this, let UBT say so -- the way it named build-tools and
+          # licenses -- rather than guessing it back in now.
+          SDK=/usr/local/lib/android/sdk
+          KEEP_LIST="licenses build-tools platform-tools cmdline-tools"
+          if [ -d "$SDK" ]; then
+            for D in "$SDK"/*; do
+              [ -e "$D" ] || continue
+              NAME=$(basename "$D")
+              KEEPIT=no
+              for K in $KEEP_LIST; do
+                [ "$NAME" = "$K" ] && KEEPIT=yes
+              done
+              if [ "$KEEPIT" = "no" ]; then
+                echo "deleting sdk/$NAME (not in the keep list: $KEEP_LIST)"
+                sudo rm -rf "$D"
+              fi
+            done
+          fi
 
           sudo rm -rf /usr/share/dotnet /opt/ghc \
                       /usr/local/share/boost /usr/local/.ghcup \
                       /usr/share/swift /opt/hostedtoolcache 2>/dev/null
 
-          # KEEP THE SDK IF THE NUMBERS ALLOW. Peak need on this ONE
-          # filesystem is the 37 GB zip plus the ~57 GB it unpacks to, and
-          # the zip is deleted the moment extraction succeeds. 100 GB is
-          # that peak with a margin. If keeping the SDK would drop free
-          # space under it, the SDK goes and this says so IN THE REPORT --
-          # a silent deletion is what produced walls 3 and 4.
+          # THE THRESHOLD IS DERIVED, NOT GUESSED (issue #51). The old 100 GB
+          # came from "the engine unpacks to ~57 GB", an ESTIMATE that was
+          # never measured and turned out one gigabyte short. 111 is
+          # 37973 MB zip + 74345 MB tree, BOTH measured by run 33964894709 --
+          # the one run that unzipped all the way through, not an estimate.
+          # The zip is deleted the moment extraction succeeds, so this is the
+          # peak with a margin. If free space would still drop under it even
+          # after the subset trim above, the subset does not fit either and
+          # the rest of the SDK goes -- silently keeping something that does
+          # not fit is what produced run 33968064489's rc 50.
           FREE_NOW=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
-          if [ "${FREE_NOW:-0}" -lt 100 ]; then
-            echo "free ${FREE_NOW} GB < 100 GB needed -- deleting the Android SDK after all"
+          if [ "${FREE_NOW:-0}" -lt 111 ]; then
+            echo "free ${FREE_NOW} GB < 111 GB needed -- deleting the rest of the Android SDK"
             sudo rm -rf /usr/local/lib/android
             echo "android_kept=no" >> "$GITHUB_OUTPUT"
+            echo "android_kept_kb=0" >> "$GITHUB_OUTPUT"
           else
-            echo "free ${FREE_NOW} GB -- KEEPING /usr/local/lib/android"
-            echo "android_kept=yes" >> "$GITHUB_OUTPUT"
+            echo "free ${FREE_NOW} GB -- keeping the SDK subset (licenses, build-tools, platform-tools, cmdline-tools)"
+            # READ THE PROPERTY BACK: the real size of what remains, not the
+            # sum of the du -sh estimates taken before any deletion.
+            KEPT_KB=$(sudo du -sk /usr/local/lib/android 2>/dev/null | cut -f1)
+            echo "android_kept=subset" >> "$GITHUB_OUTPUT"
+            echo "android_kept_kb=${KEPT_KB:-0}" >> "$GITHUB_OUTPUT"
+            echo "android sdk kept (subset), read back after deletion: ${KEPT_KB:-<du failed>} KB"
           fi
 
           # TWO filesystems, and only one of them has ever been measured.
@@ -1487,11 +1533,14 @@ jobs:
           NDK_DIR_D=/tmp/tbs_ndk_r27c
 
           # THIS IS AN ANSWER, NOT A FAILURE. If "Make room" deleted the SDK
-          # because free space would have dropped under the 100 GB margin,
+          # because free space would have dropped under the 111 GB margin,
           # there is nothing kept to re-test here, and pretending otherwise
           # would silently re-run a command that (a)/(b)/(c) already ran
-          # against no SDK.
-          if [ "${KEPT:-}" != "yes" ]; then
+          # against no SDK. `android_kept=subset` (issue #51: a subset, not
+          # the whole SDK, is what "Make room" keeps now) still has
+          # build-tools -- what wall 4 actually named -- so it counts as kept
+          # for this test; only `no` skips it.
+          if [ "${KEPT:-}" = "no" ]; then
             echo "Make room did not keep the Android SDK (android_kept=${KEPT:-<unset>})."
             echo "-- SDK was deleted for lack of free space; nothing to re-test for (f)."
             echo "rc_f=93" >> "$GITHUB_OUTPUT"
@@ -2084,6 +2133,80 @@ jobs:
             cp -r "$SAVED/Crashes/." "$RUNNER_TEMP/crashes/" 2>/dev/null
             echo "copied crashes dir: $(du -sh "$RUNNER_TEMP/crashes" 2>/dev/null | cut -f1)"
           fi
+
+      - name: Which light is lighting Valiasr -- diag_district_lights
+        id: lights
+        if: ${{ steps.secret.outputs.ok == 'yes' && steps.vk.outputs.rc == '0' && inputs.lights }}
+        env:
+          CMD: ${{ steps.find.outputs.editor || steps.pull.outputs.editor }}
+          PFX: ${{ steps.pull.outputs.exec }}
+        run: |
+          set +e
+          # THE DIFFERENTIATING MEASUREMENT issue #50 asked for. Run
+          # 33964894709 rendered three real PNGs and `district_shots` FAILED
+          # all three as stencils (midtone 0.014-0.035 against the 0.10
+          # floor) -- geometry, cameras and the level are not suspects (five
+          # other probes passed, and `render` never rebuilds), so the frame
+          # itself is what differs. Three hypotheses, none measured. This is
+          # the one measurement that tells them apart: which light actually
+          # reaches the frame, ON THE RUNNER, run the identical way the
+          # laptop's own `diag_district_lights` was (CLAUDE.md, "Open
+          # issues": removing the sun there costs 0.417 of midtone, the fill
+          # 0.014, the sky light 0.000).
+          #
+          # UNMODIFIED ON PURPOSE. diag_district_lights.py captures through
+          # SceneCapture2D + RenderingLibrary.read_render_target_raw_pixel --
+          # the identical idiom probe_district.py already uses successfully
+          # under these same flags in the step above -- so nothing in the
+          # script changed for this. If a run below needs one anyway, that is
+          # new information for the next report, not a guess made here.
+          PROJ="$GITHUB_WORKSPACE/work/TehranBlindSpot.uproject"
+          LOG="$GITHUB_WORKSPACE/lights.log"
+          rm -f "$LOG" /tmp/lights.stdout /tmp/lights.digests
+          touch /tmp/lights.mark
+          BEGAN=$(date +%s)
+          timeout 1200 $PFX "$CMD" "$PROJ" \
+            -ExecutePythonScript="$GITHUB_WORKSPACE/work/Tools/diag_district_lights.py" \
+            -RenderOffScreen -ResX=1280 -ResY=720 \
+            -AllowCPUDevices \
+            -unattended -nopause -nosplash -stdout \
+            -abslog="$LOG" > /tmp/lights.stdout 2>&1
+          RC=$?
+          SECS=$(( $(date +%s) - BEGAN ))
+          echo "rc=$RC"     >> "$GITHUB_OUTPUT"
+          echo "secs=$SECS" >> "$GITHUB_OUTPUT"
+          echo "diag_district_lights rc=$RC in ${SECS}s"
+          : > /tmp/lights.digests
+          for F in "$LOG" /tmp/lights.stdout; do
+            [ -f "$F" ] && grep -hE '##TBS##[[:space:]]*\{' "$F" >> /tmp/lights.digests 2>/dev/null
+          done
+          sed -i 's/^.*\(##TBS##\)/\1/' /tmp/lights.digests
+          sort -u /tmp/lights.digests -o /tmp/lights.digests
+          TBS=$(wc -l < /tmp/lights.digests | tr -d " ")
+          echo "tbs=$TBS" >> "$GITHUB_OUTPUT"
+          echo "##TBS## lines produced : $TBS"
+          echo "--- the digest lines themselves ---"
+          cat /tmp/lights.digests
+          # THE LAPTOP NUMBERS, printed alongside so the comparison lives in
+          # this report and not in the reader's head. Source: CLAUDE.md,
+          # "Open issues", diag_district_lights measured on Valiasr.
+          echo "--- laptop's own midtone_lost_when_removed (CLAUDE.md) ---"
+          echo '  {"Sun": 0.417, "Fill": 0.014, "SkyLight": 0.000}'
+          echo "--- runner's midtone_lost_when_removed, from the digest above ---"
+          grep -o '"midtone_lost_when_removed":[^}]*}' /tmp/lights.digests | tail -1
+          # THE SAME "absence of evidence" GAP THE ISSUE NAMED: a log read
+          # only in its last 40/60 lines cannot say a warning never appeared.
+          # This searches the WHOLE editor log, not a tail, and says which.
+          echo "--- searching the FULL editor log for a lighting-rebuild warning ---"
+          if grep -aiE "lighting needs to be rebuilt|lighting is not built" "$LOG" /tmp/lights.stdout 2>/dev/null; then
+            echo "  FOUND (lines above) -- lighting was stale when this ran."
+          else
+            echo "  NOT FOUND, full log searched (not a tail): $(wc -l < "$LOG" 2>/dev/null || echo 0) lines in $LOG, $(wc -l < /tmp/lights.stdout 2>/dev/null || echo 0) in stdout."
+          fi
+          echo "--- last 40 lines the editor printed ---"
+          tail -40 /tmp/lights.stdout 2>/dev/null
+          echo "--- last 40 lines of the editor's OWN log ---"
+          tail -40 "$LOG" 2>/dev/null
 
       - name: Mirror roundtrip -- can Releases hold the image at all?
         id: mirror_probe
@@ -2829,6 +2952,7 @@ jobs:
           ROOM_LIC:    ${{ steps.room.outputs.licenses_backed_up }}
           ROOM_KB:     ${{ steps.room.outputs.android_kb }}
           ROOM_KEPT:   ${{ steps.room.outputs.android_kept }}
+          ROOM_KEPT_KB: ${{ steps.room.outputs.android_kept_kb }}
           B_RC:    ${{ steps.boot.outputs.rc }}
           B_SECS:  ${{ steps.boot.outputs.secs }}
           B_TBS:   ${{ steps.boot.outputs.tbs }}
@@ -2841,6 +2965,9 @@ jobs:
           R_SECS:  ${{ steps.render.outputs.secs }}
           R_TBS:   ${{ steps.render.outputs.tbs }}
           R_PNGS:  ${{ steps.render.outputs.pngs }}
+          L_RC:    ${{ steps.lights.outputs.rc }}
+          L_SECS:  ${{ steps.lights.outputs.secs }}
+          L_TBS:   ${{ steps.lights.outputs.tbs }}
           DO_COMMIT: ${{ inputs.commit }}
           BRANCH:  ${{ vars.TBS_BRANCH || 'claude/gateway-auth-fix-nr7k0b' }}
         run: |
@@ -2984,12 +3111,15 @@ jobs:
             echo "  to try: it rules out the deleted-directory hypothesis for wall 3."
             echo "(f) sdk dirs kept / ubt rc                 : ${ANDFX_SDK_DIRS_F:-<step did not run>} / ${ANDFX_RC_F:-<step did not run>}"
             echo "    UBT said : ${ANDFX_MSG_F:-<step did not run>}"
-            echo "  android sdk kept / total KB : ${ROOM_KEPT:-<step did not run>} / ${ROOM_KB:-<step did not run>}"
+            echo "  android sdk kept / total KB before deletion / kept KB read back : ${ROOM_KEPT:-<step did not run>} / ${ROOM_KB:-<step did not run>} / ${ROOM_KEPT_KB:-<step did not run>}"
             echo "  rc 93 on (f) means Make room deleted the SDK for lack of free"
             echo "  space -- an answer, not a failure to try. wall 4 was UBT unable"
             echo "  to find /usr/local/lib/android/sdk/build-tools, which the Make"
             echo "  room rm -rf deleted along with everything else under android/;"
             echo "  (f) re-runs the identical command with that directory intact."
+            echo "  android_kept=subset (issue #51) means ndk/platforms/extras/cmake"
+            echo "  were dropped and licenses/build-tools/platform-tools/cmdline-tools"
+            echo "  were kept -- build-tools is what wall 4 needs."
             echo "--- ##TBS## line the androidfix step produced (a/b/c) ---"
             cat /tmp/androidfix.digest 2>/dev/null || echo "(none)"
             echo "--- ##TBS## line the androidfix (d) step produced ---"
@@ -3045,6 +3175,32 @@ jobs:
             echo "  own log was written and never printed, so the cause was"
             echo "  not measured -- the same gap fixed for the boot step and"
             echo "  repeated here."
+            echo ""
+            echo "== lights, -RenderOffScreen, Tools/diag_district_lights.py (issue #50) =="
+            echo "rc            : ${L_RC:-<step did not run -- inputs.lights was false>}"
+            echo "seconds       : ${L_SECS:-<none>}"
+            echo "##TBS## lines : ${L_TBS:-<none>}"
+            echo "  Same district_shots stencil this run's render section may"
+            echo "  show (midtone under the 0.10 floor). Three hypotheses, none"
+            echo "  measured before this step existed: lavapipe tonemapping,"
+            echo "  unlit geometry, or something else. This is the runner's"
+            echo "  own per-light contribution, comparable to the laptop's"
+            echo "  because it runs the same tool under the same"
+            echo "  -RenderOffScreen flags as the render step above."
+            echo "  laptop (CLAUDE.md) : Sun=0.417 Fill=0.014 SkyLight=0.000 midtone lost"
+            echo "  reading it: runner Sun contribution near -0.417 means light"
+            echo "  reaches the frame and the stencil is a tonemapping/exposure"
+            echo "  question; near -0.000 means light never arrives and the"
+            echo "  question is lighting, not the image; anything between is"
+            echo "  neither, and that number is the next lead."
+            echo "--- every ##TBS## line the lights step produced (includes the"
+            echo "    runner's own midtone_lost_when_removed, and the full-log"
+            echo "    search for a lighting-rebuild warning) ---"
+            cat /tmp/lights.digests 2>/dev/null || echo "(none)"
+            echo "--- last 40 lines the lights step printed ---"
+            tail -40 /tmp/lights.stdout 2>/dev/null || echo "(none)"
+            echo "--- last 40 lines of the lights editor's OWN log ---"
+            tail -40 "$GITHUB_WORKSPACE/lights.log" 2>/dev/null || echo "(none)"
             echo ""
             echo "== VERDICT =="
             if [ "${C_RC:-x}" != "0" ] && [ "${C_RC:-x}" != "x" ]; then
@@ -3157,8 +3313,22 @@ jobs:
           # that rendered nothing still delivers the report saying so.
           # Reports/district is where probe_district.py puts its shots --
           # OUT_DIR at Tools/probe_district.py:35, read rather than assumed.
+          # But Reports/district/*.png is ALSO the LAPTOP REFERENCE, committed
+          # once at caba948 (midtone 0.708-0.826, crushed 0.118-0.278) and
+          # relied on by rung 4 for comparison -- see Team/MAP.md. Committing
+          # this directory as-is overwrote that reference with the runner's
+          # own stencil frames (run 33964894709, midtone 0.014-0.035) with no
+          # record that it had happened; a later run would keep silently
+          # re-overwriting it. probe_district.py itself is UNCHANGED -- its
+          # OUT_DIR is still Reports/district, so the working tree still gets
+          # overwritten on disk every run -- only what gets COMMITTED moves,
+          # to Reports/district_runner/, so the git history keeps the laptop
+          # reference at caba948 and the runner's own frames are never lost
+          # either, just no longer under the reference's own path.
           if [ -d Reports/district ] && [ -n "$(ls -A Reports/district 2>/dev/null)" ]; then
-            git add -f Reports/district
+            mkdir -p Reports/district_runner
+            cp -a Reports/district/. Reports/district_runner/
+            git add -f Reports/district_runner
           fi
           # THE CRASH ARTEFACTS. Run 33305367382 died rc 139 with one
           # unsymbolised frame, and the engine's own crashinfo directory
