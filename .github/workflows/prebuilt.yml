@@ -67,7 +67,7 @@ on:
         type: boolean
         default: false
       androidfix:
-        description: 'try four NDK/SDK fixes in sequence for the "Sdk: not found. Required version r27c" refusal, re-measuring UBT after each -- none skipped for an earlier one answering. (d) downloads NDK r27c straight from Google and needs neither sdkmanager nor /usr/local/lib/android'
+        description: 'try five NDK/SDK fixes in sequence for the "Sdk: not found. Required version r27c" refusal, re-measuring UBT after each -- none skipped for an earlier one answering. (d) downloads NDK r27c straight from Google and needs neither sdkmanager nor /usr/local/lib/android. (e) puts back the licenses the Make room step deleted and re-runs (d)''s exact command'
         type: boolean
         default: false
       render:
@@ -138,6 +138,34 @@ jobs:
         if: steps.secret.outputs.ok == 'yes'
         run: |
           set +e
+          # WHY THIS BACKUP EXISTS. The `sudo rm -rf /usr/local/lib/android`
+          # below is what produced run 33947175788's third wall: UBT said
+          # "Android SDK license file not found" and named
+          # "Directory doesn't exist /usr/local/lib/android/sdk/licenses".
+          # The licenses directory is a handful of TEXT files, so keeping a
+          # copy costs kilobytes -- while the SDK it sits inside is a real
+          # part of what this deletion buys. That deletion is NOT free to
+          # skip: the engine zip unpacks to /home/runner/ue, which is on /,
+          # the same filesystem /usr/local is on. (The zip itself lands on
+          # /mnt/dl, line ~598, and is deleted after extraction, line ~639.)
+          #
+          # IT ALSO SETTLES A QUESTION NOBODY HAS MEASURED: whether this
+          # runner image ships accepted Android licenses AT ALL. The listing
+          # is taken BEFORE anything is removed, so an empty backup later
+          # reads as "the image never had them", not "the copy failed".
+          # Those are different answers and this project has paid for
+          # confusing them before.
+          LIC_SRC=/usr/local/lib/android/sdk/licenses
+          LIC_BAK=/home/runner/android-licenses
+          echo "--- android sdk licenses AS SHIPPED, before any deletion ---"
+          ls -la "$LIC_SRC" 2>&1 | head -20
+          mkdir -p "$LIC_BAK"
+          sudo cp -a "$LIC_SRC/." "$LIC_BAK/" 2>/dev/null
+          LIC_CP=$?
+          sudo chown -R "$(id -u):$(id -g)" "$LIC_BAK" 2>/dev/null
+          LIC_N=$(ls -1 "$LIC_BAK" 2>/dev/null | wc -l)
+          echo "licenses_backed_up=$LIC_N" >> "$GITHUB_OUTPUT"
+          echo "licenses copy rc=$LIC_CP, files kept=$LIC_N"
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
                       /usr/local/share/boost /usr/local/.ghcup \
                       /usr/share/swift /opt/hostedtoolcache 2>/dev/null
@@ -1126,6 +1154,8 @@ jobs:
           echo "  rc=$RC_A"
           echo "  --- last SDK/NDK lines UBT printed ---"
           echo "${MSG_A:-<no line matched the SDK/NDK pattern>}"
+          LAST_A=$(printf '%s\n' "$MSG_A" | tail -1 | tr -d '\r' | cut -c1-300)
+          echo "msg_a=${LAST_A:-<no line matched>}" >> "$GITHUB_OUTPUT"
           cp /tmp/androidfix_step.log /tmp/androidfix_a.log 2>/dev/null
 
           echo ""
@@ -1153,6 +1183,8 @@ jobs:
           echo "  rc=$RC_B"
           echo "  --- last SDK/NDK lines UBT printed ---"
           echo "${MSG_B:-<no line matched the SDK/NDK pattern>}"
+          LAST_B=$(printf '%s\n' "$MSG_B" | tail -1 | tr -d '\r' | cut -c1-300)
+          echo "msg_b=${LAST_B:-<no line matched>}" >> "$GITHUB_OUTPUT"
           cp /tmp/androidfix_step.log /tmp/androidfix_b.log 2>/dev/null
 
           echo ""
@@ -1175,6 +1207,8 @@ jobs:
           echo "  rc=$RC_C"
           echo "  --- last SDK/NDK lines UBT printed ---"
           echo "${MSG_C:-<no line matched the SDK/NDK pattern>}"
+          LAST_C=$(printf '%s\n' "$MSG_C" | tail -1 | tr -d '\r' | cut -c1-300)
+          echo "msg_c=${LAST_C:-<no line matched>}" >> "$GITHUB_OUTPUT"
           cp /tmp/androidfix_step.log /tmp/androidfix_c.log 2>/dev/null
 
           echo ""
@@ -1302,6 +1336,8 @@ jobs:
           echo "  ubt rc=$RC_D"
           echo "  --- last SDK/NDK lines UBT printed ---"
           echo "${MSG_D:-<no line matched the SDK/NDK pattern>}"
+          LAST_D=$(printf '%s\n' "$MSG_D" | tail -1 | tr -d '\r' | cut -c1-300)
+          echo "msg_d=${LAST_D:-<no line matched>}" >> "$GITHUB_OUTPUT"
 
           STATUS_D=fail
           [ "$RC_D" = "0" ] && STATUS_D=pass
@@ -1313,6 +1349,96 @@ jobs:
           printf '##TBS##{"v":1,"probe":"android_ndk_fix_d","status":"%s","data":{"dl_rc":%s,"unzip_rc":%s,"ubt_rc":%s}}\n' \
             "$STATUS_D" "$DL_RC" "$UNZIP_RC" "$RC_D" \
             | tee /tmp/androidfix_d.digest
+
+      - name: "androidfix (e) -- put the deleted licenses back, then re-run the SAME UBT command"
+        id: androidfix_e
+        if: ${{ steps.secret.outputs.ok == 'yes' && (steps.find.outputs.found == 'yes' || steps.pull.outputs.rc == '0') && inputs.androidfix }}
+        env:
+          ENG:   ${{ steps.find.outputs.engine || steps.pull.outputs.engine }}
+          PFX:   ${{ steps.pull.outputs.exec }}
+          LIC_N: ${{ steps.room.outputs.licenses_backed_up }}
+        run: |
+          set +e
+          PROJ="$GITHUB_WORKSPACE/work/TehranBlindSpot.uproject"
+          BUILD="$ENG/Engine/Build/BatchFiles/Linux/Build.sh"
+          NEEDLE="sdk|ndk|licen|android.*not|not.*android|platform.*valid|UnrealBuildTool.*Exception"
+          LIC_BAK=/home/runner/android-licenses
+          LIC_DST=/usr/local/lib/android/sdk/licenses
+          NDK_DIR_D=/tmp/tbs_ndk_r27c
+
+          if ! $PFX test -f "$BUILD"; then
+            echo "rc_e=91" >> "$GITHUB_OUTPUT"
+            echo "lic_e=91" >> "$GITHUB_OUTPUT"
+            echo "NO Build.sh AT $BUILD -- nothing to re-run for (e) either."
+            printf '##TBS##{"v":1,"probe":"android_ndk_fix_e","status":"fail","data":{"note":"no Build.sh, nothing attempted"}}\n' \
+              | tee /tmp/androidfix_e.digest
+            exit 0
+          fi
+
+          # NOTHING IS INVENTED HERE. If the Make room step found no licenses
+          # to copy, this step reports that and STOPS. It does not write
+          # license text of its own: the accepted-license files are SHA-1
+          # digests produced by Google's own sdkmanager, and a hash written
+          # from memory that happens to be wrong would fail in a way that
+          # looks identical to the licenses being genuinely absent. An
+          # unmeasured answer is worth more than a confident wrong one.
+          if [ -z "${LIC_N:-}" ] || [ "${LIC_N:-0}" -eq 0 ] 2>/dev/null; then
+            echo "  Make room backed up ${LIC_N:-<no value>} license files."
+            echo "  NOTHING TO RESTORE, and nothing will be fabricated."
+            echo "  What this means: the deleted-directory hypothesis for wall 3"
+            echo "  is WRONG or unmeasurable on this image -- the SDK this runner"
+            echo "  shipped had no accepted licenses to begin with. The next move"
+            echo "  is then an official Google source for the file, not a guess."
+            echo "rc_e=92" >> "$GITHUB_OUTPUT"
+            echo "lic_e=0"  >> "$GITHUB_OUTPUT"
+            printf '##TBS##{"v":1,"probe":"android_ndk_fix_e","status":"unmeasured","data":{"licenses_backed_up":0,"note":"image shipped no accepted licenses; nothing restored, nothing invented"}}\n' \
+              | tee /tmp/androidfix_e.digest
+            exit 0
+          fi
+
+          echo "=== (e) restore $LIC_N license file(s) to the path UBT named ==="
+          sudo mkdir -p "$LIC_DST"
+          sudo cp -a "$LIC_BAK/." "$LIC_DST/" 2>&1
+          CP_RC=$?
+          echo "  cp rc=$CP_RC"
+          # READ IT BACK. A copy that silently did nothing and a copy that
+          # worked produce identical exit codes often enough that the exit
+          # code is not the measurement -- the listing is.
+          echo "  --- what is actually at $LIC_DST now ---"
+          ls -la "$LIC_DST" 2>&1 | head -20
+          LIC_SEEN=$(ls -1 "$LIC_DST" 2>/dev/null | wc -l)
+          LIC_BYTES=$(du -sb "$LIC_DST" 2>/dev/null | cut -f1)
+          echo "  files=$LIC_SEEN  bytes=${LIC_BYTES:-<du unavailable>}"
+
+          NDK_E=$($PFX sh -c "find '$NDK_DIR_D' -maxdepth 1 -type d -name 'android-ndk-r27c*'" | head -1)
+          echo "  NDKROOT -> ${NDK_E:-<empty -- step (d) did not leave an NDK here>}"
+
+          # THE COMMAND IS BYTE-IDENTICAL TO STEP (d)'s. That is the whole
+          # point: (d) already ran this exact line and got "Android SDK
+          # license file not found". If the message changes now, the ONLY
+          # thing that changed is the licenses, so the change is attributable
+          # instead of guessed. Do not add ANDROID_HOME or any other variable
+          # here -- UBT already resolved that path on its own in (d), and a
+          # second change would make this step unable to answer its question.
+          $PFX env NDKROOT="$NDK_E" "$BUILD" TehranBlindSpot Android Development \
+            -project="$PROJ" -waitmutex -NoUba > /tmp/androidfix_e_step.log 2>&1
+          RC_E=$?
+          MSG_E=$(grep -n -i -E "$NEEDLE" /tmp/androidfix_e_step.log 2>/dev/null | tail -5)
+          echo "  ubt rc=$RC_E"
+          echo "  --- last SDK/NDK/licence lines UBT printed ---"
+          echo "${MSG_E:-<no line matched the SDK/NDK pattern>}"
+
+          STATUS_E=fail
+          [ "$RC_E" = "0" ] && STATUS_E=pass
+
+          echo "rc_e=$RC_E"        >> "$GITHUB_OUTPUT"
+          echo "lic_e=$LIC_SEEN"   >> "$GITHUB_OUTPUT"
+          LAST_E=$(printf '%s\n' "$MSG_E" | tail -1 | tr -d '\r' | cut -c1-300)
+          echo "msg_e=${LAST_E:-<no line matched>}" >> "$GITHUB_OUTPUT"
+
+          printf '##TBS##{"v":1,"probe":"android_ndk_fix_e","status":"%s","data":{"licenses_restored":%s,"ubt_rc":%s}}\n' \
+            "$STATUS_E" "${LIC_SEEN:-0}" "$RC_E" \
+            | tee /tmp/androidfix_e.digest
 
       - name: Start it on this project
         id: boot
@@ -2589,6 +2715,14 @@ jobs:
           ANDFX_RC_D:      ${{ steps.androidfix_d.outputs.rc_d }}
           ANDFX_DL_RC_D:   ${{ steps.androidfix_d.outputs.dl_rc_d }}
           ANDFX_UNZIP_RC_D: ${{ steps.androidfix_d.outputs.unzip_rc_d }}
+          ANDFX_MSG_A: ${{ steps.androidfix.outputs.msg_a }}
+          ANDFX_MSG_B: ${{ steps.androidfix.outputs.msg_b }}
+          ANDFX_MSG_C: ${{ steps.androidfix.outputs.msg_c }}
+          ANDFX_MSG_D: ${{ steps.androidfix_d.outputs.msg_d }}
+          ANDFX_RC_E:  ${{ steps.androidfix_e.outputs.rc_e }}
+          ANDFX_LIC_E: ${{ steps.androidfix_e.outputs.lic_e }}
+          ANDFX_MSG_E: ${{ steps.androidfix_e.outputs.msg_e }}
+          ROOM_LIC:    ${{ steps.room.outputs.licenses_backed_up }}
           B_RC:    ${{ steps.boot.outputs.rc }}
           B_SECS:  ${{ steps.boot.outputs.secs }}
           B_TBS:   ${{ steps.boot.outputs.tbs }}
@@ -2720,22 +2854,34 @@ jobs:
             echo "--- ##TBS## line the androidgate step produced ---"
             cat /tmp/androidgate.digest 2>/dev/null || echo "(none)"
             echo ""
-            echo "== androidfix, four NDK/SDK fixes for the r27c refusal, none skipped =="
+            echo "== androidfix, five NDK/SDK fixes for the r27c refusal, none skipped =="
             echo "(a) NDKROOT=ANDROID_NDK_ROOT        ubt rc : ${ANDFX_RC_A:-<step did not run>}"
+            echo "    UBT said : ${ANDFX_MSG_A:-<step did not run>}"
             echo "(b) sdkmanager install rc / ubt rc         : ${ANDFX_SDKM:-<step did not run>} / ${ANDFX_RC_B:-<step did not run>}"
+            echo "    UBT said : ${ANDFX_MSG_B:-<step did not run>}"
             echo "(c) SetupAndroid.sh rc / ubt rc            : ${ANDFX_SETUP:-<step did not run>} / ${ANDFX_RC_C:-<step did not run>}"
+            echo "    UBT said : ${ANDFX_MSG_C:-<step did not run>}"
             echo "(d) download rc / unzip rc / ubt rc        : ${ANDFX_DL_RC_D:-<step did not run>} / ${ANDFX_UNZIP_RC_D:-<step did not run>} / ${ANDFX_RC_D:-<step did not run>}"
-            echo "  rc 91 on all four means there was no Build.sh to re-run, not"
+            echo "    UBT said : ${ANDFX_MSG_D:-<step did not run>}"
+            echo "  rc 91 on all five means there was no Build.sh to re-run, not"
             echo "  that the fixes failed. rc 127 for the sdkmanager, setup, curl or"
             echo "  unzip rc means the tool was not found on this route -- read as"
             echo "  absent, not as a fix that was tried and lost. (d) needs neither"
             echo "  sdkmanager nor /usr/local/lib/android -- it downloads NDK r27c"
             echo "  straight from Google, so if (a)-(c) fail the same way and (d)"
             echo "  also fails, that rules out the deleted-directory hypothesis."
+            echo "(e) licenses restored / ubt rc            : ${ANDFX_LIC_E:-<step did not run>} / ${ANDFX_RC_E:-<step did not run>}"
+            echo "    UBT said : ${ANDFX_MSG_E:-<step did not run>}"
+            echo "  licenses this image SHIPPED (counted before any deletion): ${ROOM_LIC:-<step did not run>}"
+            echo "  rc 92 on (e) means there was nothing to restore -- the image"
+            echo "  shipped no accepted licenses. That is an ANSWER, not a failure"
+            echo "  to try: it rules out the deleted-directory hypothesis for wall 3."
             echo "--- ##TBS## line the androidfix step produced (a/b/c) ---"
             cat /tmp/androidfix.digest 2>/dev/null || echo "(none)"
             echo "--- ##TBS## line the androidfix (d) step produced ---"
             cat /tmp/androidfix_d.digest 2>/dev/null || echo "(none)"
+            echo "--- ##TBS## line the androidfix (e) step produced ---"
+            cat /tmp/androidfix_e.digest 2>/dev/null || echo "(none)"
             echo ""
             echo "== boot, -NullRHI, running Tools/probe_boot.py =="
             echo "rc         : ${B_RC:-<step did not run>}"
